@@ -1,0 +1,16 @@
+pkgname=accio-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Switch between Anthropic accounts in Claude Code without re-authenticating"
+arch=('x86_64')
+url="https://github.com/nickheyer/accio"
+license=('MIT')
+provides=('accio')
+conflicts=('accio')
+source=("accio-${pkgver}-x86_64-linux.tar.gz::https://github.com/nickheyer/accio/releases/download/v${pkgver}/accio-${pkgver}-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/accio" "${pkgdir}/usr/bin/accio"
+  install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -1,0 +1,15 @@
+[package]
+name = "accio"
+version = "0.1.0"
+edition = "2021"
+description = "Switch between Anthropic accounts in Claude Code without re-authenticating"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.28"
+dirs = "5"
+ratatui = "0.29"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+ureq = { version = "2", features = ["json"] }
