@@ -20,7 +20,7 @@ cargo install --path .
 There is almost nothing here:
 
 - We are just doing the same thing that claude already does
-- Accounts are backed up and restored from at `~/.config/accio/accounts/<your other account>.json`
+- Accounts are backed up and restored from at `~/.config/accio/accounts/<your other account>.json` (linux) or `~/Library/Application Support/accio/accounts` (mac), sorry windows hope for the best
 - Accio gets usage from CC `/usage`
 - Basically just minimizes reauth requirements and lets you switch based on usage
 - `CLAUDE_CONFIG_DIR` is used if set

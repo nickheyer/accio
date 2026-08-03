@@ -1,4 +1,4 @@
-//! Profile store + Claude Code files accio touches: `<claude dir>/.credentials.json` and `oauthAccount` in `~/.claude.json`
+//! Profile store plus live claude credentials for swap
 
 use std::fs;
 use std::io::Write as _;
@@ -7,6 +7,9 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 pub struct Profile {
     pub name: String,
@@ -99,7 +102,7 @@ impl Store {
     // Read live cc creds - if tracked profile, swap in, else import new tracked profile and set active
     pub fn absorb_live(&mut self) -> Result<()> {
         self.active = None;
-        let live_creds = match read_json(&self.creds_path) {
+        let live_creds = match read_live_creds(&self.creds_path) {
             Some(v) => v,
             None => return Ok(()),
         };
@@ -154,10 +157,7 @@ impl Store {
     pub fn activate(&mut self, idx: usize) -> Result<()> {
         self.absorb_live()?; // capture freshest tokens of the outgoing account
         let p = &self.profiles[idx];
-        write_atomic(
-            &self.creds_path,
-            serde_json::to_string(&p.credentials)?.as_bytes(),
-        )?;
+        write_live_creds(&self.creds_path, &p.credentials)?;
         if !p.oauth_account.is_null() {
             let mut claude_json = read_json(&self.claude_json_path).unwrap_or_else(|| json!({}));
             if let Some(obj) = claude_json.as_object_mut() {
@@ -181,10 +181,7 @@ impl Store {
         self.profiles[idx].credentials = credentials;
         save_profile(&self.accounts_dir, &self.profiles[idx])?;
         if self.active == Some(idx) {
-            write_atomic(
-                &self.creds_path,
-                serde_json::to_string(&self.profiles[idx].credentials)?.as_bytes(),
-            )?;
+            write_live_creds(&self.creds_path, &self.profiles[idx].credentials)?;
         }
         Ok(())
     }
@@ -207,13 +204,11 @@ impl Store {
     // Park live cc creds, run cc login, save res as profile
     pub fn add_account(&mut self, name: Option<&str>) -> Result<String> {
         self.absorb_live()?; // parked
-        let backup = fs::read(&self.creds_path).ok();
-        if backup.is_some() {
-            fs::remove_file(&self.creds_path)?;
-        }
-        let restore = |b: &Option<Vec<u8>>| {
-            if let Some(bytes) = b {
-                let _ = write_atomic(&self.creds_path, bytes);
+        let backup = read_live_creds(&self.creds_path);
+        clear_live_creds(&self.creds_path)?;
+        let restore = |b: &Option<Value>| {
+            if let Some(creds) = b {
+                let _ = write_live_creds(&self.creds_path, creds);
             }
         };
 
@@ -227,7 +222,7 @@ impl Store {
             Ok(_) => {}
         }
 
-        let new_creds = match read_json(&self.creds_path) {
+        let new_creds = match read_live_creds(&self.creds_path) {
             Some(v) => v,
             None => {
                 restore(&backup);
@@ -310,6 +305,62 @@ fn sanitize_name(s: &str) -> String {
 
 fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+// Live cc creds sit in the keychain on mac
+fn read_live_creds(creds_path: &Path) -> Option<Value> {
+    #[cfg(target_os = "macos")]
+    if let Some(v) = keychain_read() {
+        return Some(v);
+    }
+    read_json(creds_path)
+}
+
+fn write_live_creds(creds_path: &Path, creds: &Value) -> Result<()> {
+    let body = serde_json::to_string(creds)?;
+    #[cfg(target_os = "macos")]
+    if keychain_write(&body).is_ok() {
+        // Stale file must not shadow the keychain
+        let _ = fs::remove_file(creds_path);
+        return Ok(());
+    }
+    write_atomic(creds_path, body.as_bytes())
+}
+
+fn clear_live_creds(creds_path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("security")
+        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE])
+        .output();
+    if creds_path.exists() {
+        fs::remove_file(creds_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_read() -> Option<Value> {
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_write(body: &str) -> Result<()> {
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let out = Command::new("security")
+        .args(["add-generic-password", "-U", "-a", &user, "-s", KEYCHAIN_SERVICE, "-w", body])
+        .output()
+        .context("cant run `security`")?;
+    if !out.status.success() {
+        bail!("keychain write failed - is the login keychain unlocked?");
+    }
+    Ok(())
 }
 
 // write tmp file in same dir w/ chmod 0600
