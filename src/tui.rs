@@ -2,13 +2,10 @@ use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+use accio_provider::{humanize_until, Account, Fetch, Outcome, Provider, Severity, Usage, Window};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*, DefaultTerminal};
-use serde_json::Value;
-
-use crate::oauth::{self, Severity, Usage, Window};
-use crate::store::{Profile, Store};
 
 enum UsageState {
     Loading,
@@ -16,10 +13,10 @@ enum UsageState {
     Error(String),
 }
 
-struct FetchResult {
-    name: String,
-    refreshed_creds: Option<Value>,
-    usage: std::result::Result<Value, String>,
+struct FetchMsg {
+    provider: usize,
+    account: String,
+    outcome: Outcome,
 }
 
 enum Mode {
@@ -35,29 +32,31 @@ enum Action {
 }
 
 pub fn run() -> Result<()> {
-    let store = Store::load()?;
+    let providers = crate::providers()?;
     let mut terminal = ratatui::init();
-    let result = App::new(store).run(&mut terminal);
+    let result = App::new(providers).run(&mut terminal);
     ratatui::restore();
     result
 }
 
 struct App {
-    store: Store,
-    selected: usize,
-    usage: HashMap<String, UsageState>,
+    providers: Vec<Box<dyn Provider>>,
+    tab: usize,
+    selected: Vec<usize>,
+    usage: HashMap<(usize, String), UsageState>,
     mode: Mode,
     status: String,
-    tx: Sender<FetchResult>,
-    rx: Receiver<FetchResult>,
+    tx: Sender<FetchMsg>,
+    rx: Receiver<FetchMsg>,
 }
 
 impl App {
-    fn new(store: Store) -> Self {
+    fn new(providers: Vec<Box<dyn Provider>>) -> Self {
         let (tx, rx) = channel();
-        let selected = store.active.unwrap_or(0);
+        let selected: Vec<usize> = providers.iter().map(|p| p.active().unwrap_or(0)).collect();
         App {
-            store,
+            providers,
+            tab: 0,
             selected,
             usage: HashMap::new(),
             mode: Mode::Normal,
@@ -83,14 +82,15 @@ impl App {
             match self.on_key(key)? {
                 Action::Quit => return Ok(()),
                 Action::Add(name) => {
-                    // Leave the TUI entirely while Claude Code's own login runs.
+                    // Leave the TUI entirely while the provider's own login runs.
                     ratatui::restore();
-                    let outcome = self.store.add_account(name.as_deref());
+                    let outcome = self.providers[self.tab].add(name.as_deref());
                     *terminal = ratatui::init();
                     match outcome {
                         Ok(msg) => {
                             self.status = msg;
-                            self.selected = self.store.active.unwrap_or(0);
+                            self.selected[self.tab] =
+                                self.providers[self.tab].active().unwrap_or(0);
                             self.fetch_all();
                         }
                         Err(e) => self.status = format!("add failed: {e:#}"),
@@ -123,10 +123,10 @@ impl App {
                 let name = name.clone();
                 self.mode = Mode::Normal;
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                    match self.store.delete(&name) {
+                    match self.providers[self.tab].delete(&name) {
                         Ok(()) => {
                             self.status = format!("deleted '{name}'");
-                            self.usage.remove(&name);
+                            self.usage.remove(&(self.tab, name));
                             self.clamp_selection();
                         }
                         Err(e) => self.status = format!("{e:#}"),
@@ -140,44 +140,64 @@ impl App {
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> Result<Action> {
+        let n = self.providers[self.tab].accounts().len();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Action::Quit)
             }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.tab = (self.tab + 1) % self.providers.len();
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.tab = (self.tab + self.providers.len() - 1) % self.providers.len();
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.store.profiles.is_empty() {
-                    self.selected = (self.selected + 1) % self.store.profiles.len();
+                if n > 0 {
+                    self.selected[self.tab] = (self.selected[self.tab] + 1) % n;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if !self.store.profiles.is_empty() {
-                    self.selected =
-                        (self.selected + self.store.profiles.len() - 1) % self.store.profiles.len();
+                if n > 0 {
+                    self.selected[self.tab] = (self.selected[self.tab] + n - 1) % n;
                 }
             }
             KeyCode::Enter => {
-                if self.store.profiles.is_empty() {
+                if n == 0 {
                     return Ok(Action::None);
                 }
-                if self.store.active == Some(self.selected) {
-                    self.status = format!("'{}' is already active", self.current_name());
+                let sel = self.selected[self.tab];
+                let name = self.providers[self.tab]
+                    .accounts()
+                    .get(sel)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default();
+                let p = &mut self.providers[self.tab];
+                if p.active() == Some(sel) {
+                    self.status = format!("'{name}' is already active");
                 } else {
-                    match self.store.activate(self.selected) {
-                        Ok(()) => self.status = format!("switched to '{}'", self.current_name()),
+                    match p.activate(sel) {
+                        Ok(()) => {
+                            self.status = format!("switched to '{name}'");
+                            self.selected[self.tab] = p.active().unwrap_or(sel);
+                        }
                         Err(e) => self.status = format!("switch failed: {e:#}"),
                     }
                 }
             }
             KeyCode::Char('a') => self.mode = Mode::AddName(String::new()),
             KeyCode::Char('d') => {
-                if self.store.profiles.is_empty() {
+                if n == 0 {
                     return Ok(Action::None);
                 }
-                if self.store.active == Some(self.selected) {
+                let sel = self.selected[self.tab];
+                let p = &self.providers[self.tab];
+                if p.active() == Some(sel) {
                     self.status = "can't delete the active account - switch away first".into();
                 } else {
-                    self.mode = Mode::ConfirmDelete(self.current_name());
+                    self.mode = Mode::ConfirmDelete(
+                        p.accounts().get(sel).map(|a| a.name.clone()).unwrap_or_default(),
+                    );
                 }
             }
             KeyCode::Char('r') => {
@@ -189,119 +209,118 @@ impl App {
         Ok(Action::None)
     }
 
-    fn current_name(&self) -> String {
-        self.store
-            .profiles
-            .get(self.selected)
-            .map(|p| p.name.clone())
-            .unwrap_or_default()
-    }
-
     fn clamp_selection(&mut self) {
-        if self.store.profiles.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.store.profiles.len() {
-            self.selected = self.store.profiles.len() - 1;
+        for (i, p) in self.providers.iter().enumerate() {
+            let n = p.accounts().len();
+            let sel = &mut self.selected[i];
+            if n == 0 {
+                *sel = 0;
+            } else if *sel >= n {
+                *sel = n - 1;
+            }
         }
     }
 
     fn fetch_all(&mut self) {
-        for i in 0..self.store.profiles.len() {
-            let name = self.store.profiles[i].name.clone();
-            let creds = self.store.profiles[i].credentials.clone();
-            self.usage.insert(name.clone(), UsageState::Loading);
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let mut creds = creds;
-                let refreshed = match oauth::ensure_fresh(&mut creds) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(FetchResult {
-                            name,
-                            refreshed_creds: None,
-                            usage: Err(format!("{e:#}")),
-                        });
-                        return;
-                    }
-                };
-                let token = creds
-                    .pointer("/claudeAiOauth/accessToken")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let usage = oauth::fetch_usage(&token).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(FetchResult {
-                    name,
-                    refreshed_creds: refreshed.then_some(creds),
-                    usage,
+        for pi in 0..self.providers.len() {
+            if let Err(e) = self.providers[pi].refresh() {
+                self.status = format!("{}: {e:#}", self.providers[pi].name());
+            }
+            for Fetch { account, job } in self.providers[pi].fetches() {
+                self.usage.insert((pi, account.clone()), UsageState::Loading);
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(FetchMsg { provider: pi, account, outcome: job() });
                 });
-            });
+            }
         }
+        self.clamp_selection();
     }
 
     fn drain_fetches(&mut self) {
-        while let Ok(fr) = self.rx.try_recv() {
-            if let Some(creds) = fr.refreshed_creds {
-                if let Err(e) = self.store.update_credentials(&fr.name, creds) {
-                    self.status = format!("failed to save refreshed token: {e:#}");
-                }
-            }
-            let state = match fr.usage {
-                Ok(v) => {
-                    let usage = oauth::parse_usage(&v);
-                    if usage.windows.is_empty() && usage.facts.is_empty() {
-                        UsageState::Error("no usage data in response".into())
-                    } else {
-                        UsageState::Ready(usage)
+        while let Ok(msg) = self.rx.try_recv() {
+            if let Some(state) = msg.outcome.state {
+                if let Some(p) = self.providers.get_mut(msg.provider) {
+                    if let Err(e) = p.absorb_fetch(&msg.account, state) {
+                        self.status = format!("failed to save refreshed token: {e:#}");
                     }
                 }
+            }
+            let ustate = match msg.outcome.usage {
+                Ok(u) => UsageState::Ready(u),
                 Err(e) => UsageState::Error(e),
             };
-            self.usage.insert(fr.name, state);
+            self.usage.insert((msg.provider, msg.account), ustate);
         }
     }
 
+    fn usage_state(&self, name: &str) -> Option<&UsageState> {
+        self.usage.get(&(self.tab, name.to_string()))
+    }
+
     fn render(&self, f: &mut Frame) {
-        let list_height = (self.store.profiles.len() as u16 + 2).max(3);
-        let [accounts_area, usage_area, footer_area] = Layout::vertical([
+        let list_height = (self.providers[self.tab].accounts().len() as u16 + 2).max(3);
+        let [tabs_area, accounts_area, usage_area, footer_area] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(list_height),
             Constraint::Min(4),
             Constraint::Length(2),
         ])
         .areas(f.area());
+        self.render_tabs(f, tabs_area);
         self.render_accounts(f, accounts_area);
         self.render_usage(f, usage_area);
         self.render_footer(f, footer_area);
     }
 
+    fn render_tabs(&self, f: &mut Frame, area: Rect) {
+        let mut spans = vec![Span::styled(" accio ", Style::new().bold()), Span::raw(" ")];
+        for (i, p) in self.providers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", Style::new().dark_gray()));
+            }
+            spans.push(if i == self.tab {
+                Span::styled(p.name().to_string(), Style::new().green().bold())
+            } else {
+                Span::styled(p.name().to_string(), Style::new().dim())
+            });
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
     fn render_accounts(&self, f: &mut Frame, area: Rect) {
         let width = area.width.saturating_sub(6) as usize; // borders, padding, selection arrow
-        let ps = &self.store.profiles;
-        let name_w = column(ps, |p| p.name.chars().count(), 4, 18);
-        let mail_w = column(ps, |p| p.email().unwrap_or("-").chars().count(), 5, 30);
-        let plan_w = column(ps, |p| p.subscription().unwrap_or("").chars().count(), 3, 12);
+        let p = &self.providers[self.tab];
+        let rows = p.accounts();
+        let name_w = column(&rows, |r| r.name.chars().count(), 4, 18);
+        let mail_w = column(&rows, |r| r.email.as_deref().unwrap_or("-").chars().count(), 5, 30);
+        let plan_w = column(&rows, |r| r.plan.as_deref().unwrap_or("").chars().count(), 3, 12);
 
-        let items: Vec<ListItem> = if self.store.profiles.is_empty() {
+        let items: Vec<ListItem> = if rows.is_empty() {
             vec![ListItem::new(Line::styled(
                 "no accounts yet - press 'a' to add one",
                 Style::new().dim(),
             ))]
         } else {
-            self.store
-                .profiles
-                .iter()
+            rows.iter()
                 .enumerate()
-                .map(|(i, p)| {
-                    let active = self.store.active == Some(i);
+                .map(|(i, r)| {
+                    let active = p.active() == Some(i);
                     let left = vec![
                         Span::styled(
-                            pad(&p.name, name_w),
+                            pad(&r.name, name_w),
                             if active { Style::new().green().bold() } else { Style::new() },
                         ),
                         Span::raw("  "),
-                        Span::styled(pad(p.email().unwrap_or("-"), mail_w), Style::new().dim()),
+                        Span::styled(
+                            pad(r.email.as_deref().unwrap_or("-"), mail_w),
+                            Style::new().dim(),
+                        ),
                         Span::raw("  "),
-                        Span::styled(pad(p.subscription().unwrap_or(""), plan_w), Style::new().dim()),
+                        Span::styled(
+                            pad(r.plan.as_deref().unwrap_or(""), plan_w),
+                            Style::new().dim(),
+                        ),
                         Span::raw("  "),
                         if active {
                             Span::styled("● active", Style::new().green())
@@ -309,18 +328,15 @@ impl App {
                             Span::raw("")
                         },
                     ];
-                    ListItem::new(Line::from(justify(left, self.summary(&p.name), width)))
+                    ListItem::new(Line::from(justify(left, self.summary(&r.name), width)))
                 })
                 .collect()
         };
 
-        let mut list_state = ListState::default().with_selected(Some(self.selected));
+        let mut list_state = ListState::default().with_selected(Some(self.selected[self.tab]));
         f.render_stateful_widget(
             List::new(items)
-                .block(panel(format!(
-                    " accio - accounts ({}) ",
-                    self.store.profiles.len()
-                )))
+                .block(panel(format!(" {} accounts ({}) ", p.name(), rows.len())))
                 .highlight_symbol("▶ ")
                 .highlight_style(Style::new().bold()),
             area,
@@ -330,7 +346,7 @@ impl App {
 
     // The worst window an account is sitting at
     fn summary(&self, name: &str) -> Vec<Span<'static>> {
-        match self.usage.get(name) {
+        match self.usage_state(name) {
             None | Some(UsageState::Loading) => {
                 vec![Span::styled("fetching…", Style::new().dim())]
             }
@@ -358,20 +374,28 @@ impl App {
 
     fn render_usage(&self, f: &mut Frame, area: Rect) {
         let width = area.width.saturating_sub(4) as usize; // borders + padding
-        let (title, lines) = match self.store.profiles.get(self.selected) {
-            None => (" usage ".to_string(), Vec::new()),
-            Some(p) => {
-                let lines = match self.usage.get(&p.name) {
-                    None | Some(UsageState::Loading) => {
-                        vec![Line::styled("fetching…", Style::new().dim())]
-                    }
-                    Some(UsageState::Error(e)) => {
-                        vec![Line::styled(format!("unavailable: {e}"), Style::new().red())]
-                    }
-                    Some(UsageState::Ready(u)) => usage_lines(u, width),
-                };
-                (format!(" usage - {} ", p.name), lines)
-            }
+        let p = &self.providers[self.tab];
+        let rows = p.accounts();
+        let (title, lines) = if rows.is_empty() {
+            (" usage ".to_string(), info_lines(p.as_ref()))
+        } else {
+            let name = rows
+                .get(self.selected[self.tab])
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let lines = match self.usage_state(&name) {
+                None | Some(UsageState::Loading) => {
+                    vec![Line::styled("fetching…", Style::new().dim())]
+                }
+                Some(UsageState::Error(e)) => {
+                    vec![Line::styled(format!("unavailable: {e}"), Style::new().red())]
+                }
+                Some(UsageState::Ready(u)) if u.windows.is_empty() && u.facts.is_empty() => {
+                    vec![Line::styled("nothing to show", Style::new().dim())]
+                }
+                Some(UsageState::Ready(u)) => usage_lines(u, width),
+            };
+            (format!(" usage - {name} "), lines)
         };
         f.render_widget(Paragraph::new(lines).block(panel(title)), area);
     }
@@ -390,7 +414,7 @@ impl App {
             Mode::Normal => Line::styled(self.status.clone(), Style::new().cyan()),
         };
         let help = Line::styled(
-            "↑/↓ select · enter switch · a add · d delete · r refresh · q quit",
+            "←/→ provider · ↑/↓ select · enter switch · a add · d delete · r refresh · q quit",
             Style::new().dim(),
         );
         f.render_widget(
@@ -400,6 +424,24 @@ impl App {
     }
 }
 
+// What an empty provider tab manages, straight from the provider itself
+fn info_lines(p: &dyn Provider) -> Vec<Line<'static>> {
+    let info = p.info();
+    if info.is_empty() {
+        return Vec::new();
+    }
+    let label_w = info.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0).clamp(4, 12);
+    let mut lines = vec![Line::raw("")];
+    lines.extend(info.iter().map(|(l, v)| {
+        Line::from(vec![
+            Span::styled(pad(l, label_w), Style::new().dim()),
+            Span::raw("  "),
+            Span::raw(v.clone()),
+        ])
+    }));
+    lines
+}
+
 fn panel(title: String) -> Block<'static> {
     Block::bordered()
         .border_style(Style::new().dark_gray())
@@ -407,8 +449,8 @@ fn panel(title: String) -> Block<'static> {
         .title(title)
 }
 
-fn column(profiles: &[Profile], f: impl Fn(&Profile) -> usize, min: usize, max: usize) -> usize {
-    profiles.iter().map(f).max().unwrap_or(min).clamp(min, max)
+fn column(rows: &[Account], f: impl Fn(&Account) -> usize, min: usize, max: usize) -> usize {
+    rows.iter().map(f).max().unwrap_or(min).clamp(min, max)
 }
 
 fn usage_lines(u: &Usage, width: usize) -> Vec<Line<'static>> {
@@ -459,7 +501,7 @@ fn usage_line(w: &Window, label_w: usize, bar_w: usize) -> Line<'static> {
     ));
     if let Some(t) = w.resets_at {
         spans.push(Span::styled(
-            format!("  resets in {}", oauth::humanize_until(t)),
+            format!("  resets in {}", humanize_until(t)),
             Style::new().dim(),
         ));
     }

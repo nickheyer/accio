@@ -6,13 +6,60 @@ version = 4
 name = "accio"
 version = "0.0.1"
 dependencies = [
+ "accio-claude",
+ "accio-codex",
+ "accio-gemini",
+ "accio-grok",
+ "accio-provider",
+ "anyhow",
+ "crossterm",
+ "ratatui",
+]
+
+[[package]]
+name = "accio-claude"
+version = "0.0.1"
+dependencies = [
+ "accio-provider",
  "anyhow",
  "chrono",
- "crossterm",
  "dirs",
- "ratatui",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "accio-codex"
+version = "0.0.1"
+dependencies = [
+ "accio-provider",
+ "anyhow",
+]
+
+[[package]]
+name = "accio-gemini"
+version = "0.0.1"
+dependencies = [
+ "accio-provider",
+ "anyhow",
+]
+
+[[package]]
+name = "accio-grok"
+version = "0.0.1"
+dependencies = [
+ "accio-provider",
+ "anyhow",
+]
+
+[[package]]
+name = "accio-provider"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "serde_json",
 ]
 
 [[package]]

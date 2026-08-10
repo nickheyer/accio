@@ -1,0 +1,11 @@
+[package]
+name = "accio-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+serde_json.workspace = true

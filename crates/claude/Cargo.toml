@@ -1,0 +1,13 @@
+[package]
+name = "accio-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+accio-provider.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

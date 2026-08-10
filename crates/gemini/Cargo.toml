@@ -1,0 +1,9 @@
+[package]
+name = "accio-gemini"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+accio-provider.workspace = true
+anyhow.workspace = true

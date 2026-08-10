@@ -1,15 +1,42 @@
-[package]
-name = "accio"
+[workspace]
+members = [
+    "crates/provider",
+    "crates/claude",
+    "crates/codex",
+    "crates/grok",
+    "crates/gemini",
+]
+
+[workspace.package]
 version = "0.0.1"
 edition = "2021"
-description = "Switch between Anthropic accounts in Claude Code without re-authenticating"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+accio-provider = { path = "crates/provider" }
+accio-claude = { path = "crates/claude" }
+accio-codex = { path = "crates/codex" }
+accio-grok = { path = "crates/grok" }
+accio-gemini = { path = "crates/gemini" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-crossterm = "0.28"
 dirs = "5"
-ratatui = "0.29"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 ureq = { version = "2", features = ["json"] }
+
+[package]
+name = "accio"
+version.workspace = true
+edition.workspace = true
+description = "Switch between Anthropic accounts in Claude Code without re-authenticating"
+license.workspace = true
+
+[dependencies]
+accio-provider.workspace = true
+accio-claude.workspace = true
+accio-codex.workspace = true
+accio-grok.workspace = true
+accio-gemini.workspace = true
+anyhow.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
