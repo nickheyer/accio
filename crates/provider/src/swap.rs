@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::fsutil::{read_json, sanitize_name, write_atomic};
-use crate::{Account, Fetch, Job, Provider};
+use crate::{overlay, Account, Fetch, Job, Knob, Provider};
 
 // the parts of a provider that are actually its own
 pub trait Backend {
@@ -20,6 +20,16 @@ pub trait Backend {
     fn fetch(&self, files: BTreeMap<String, String>) -> Job;
     fn info(&self) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    // settings a configured profile exposes
+    fn knobs(&self) -> Vec<Knob> {
+        Vec::new()
+    }
+
+    // turn filled knobs into profile file entries
+    fn compose(&self, _values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 }
 
@@ -76,9 +86,32 @@ impl<B: Backend> Swap<B> {
         Ok(store)
     }
 
+    // union of every profile's overlay claims, so switches clean up after each other
+    fn spec(&self) -> overlay::Spec {
+        let mut spec = overlay::Spec::default();
+        for p in &self.profiles {
+            spec.add(&p.files);
+        }
+        spec
+    }
+
+    fn read_surface(&self) -> BTreeMap<String, String> {
+        let mut live = overlay::read(&self.spec());
+        live.extend(self.backend.read_live());
+        live
+    }
+
+    fn write_surface(&self, contents: &BTreeMap<String, String>) -> Result<()> {
+        let (overlays, plain) = overlay::split(contents);
+        self.backend.write_live(&plain)?;
+        let mut spec = self.spec();
+        spec.add(&overlays);
+        overlay::write(&spec, &overlays)
+    }
+
     fn absorb_live(&mut self) -> Result<()> {
         self.active = None;
-        let live = self.backend.read_live();
+        let live = self.read_surface();
         if live.is_empty() {
             return Ok(());
         }
@@ -186,7 +219,7 @@ impl<B: Backend> Provider for Swap<B> {
             .iter()
             .position(|p| p.name == name)
             .context("account vanished during switch")?;
-        self.backend.write_live(&self.profiles[idx].files)?;
+        self.write_surface(&self.profiles[idx].files)?;
         self.active = Some(idx);
         self.set_marker(idx)
     }
@@ -212,20 +245,20 @@ impl<B: Backend> Provider for Swap<B> {
             bail!("no login command for '{}'", self.backend.name());
         }
         self.absorb_live()?; // parked
-        let backup = self.backend.read_live();
-        self.backend.write_live(&BTreeMap::new())?;
+        let backup = self.read_surface();
+        self.write_surface(&BTreeMap::new())?;
 
         println!("\naccio starting `{}` - sign in then exit\n", login.join(" "));
         let status = Command::new(&login[0]).args(&login[1..]).status();
         if let Err(e) = status {
-            let _ = self.backend.write_live(&backup);
+            let _ = self.write_surface(&backup);
             return Err(e)
                 .context(format!("could not run `{}` - is it on your PATH??", login[0]));
         }
 
-        let live = self.backend.read_live();
+        let live = self.read_surface();
         if live.is_empty() {
-            let _ = self.backend.write_live(&backup);
+            let _ = self.write_surface(&backup);
             bail!("login was not completed - previous creds restored");
         }
 
@@ -266,6 +299,41 @@ impl<B: Backend> Provider for Swap<B> {
         Ok(format!("added '{name}' ({email})"))
     }
 
+    fn knobs(&self) -> Vec<Knob> {
+        self.backend.knobs()
+    }
+
+    fn configure(&mut self, name: Option<&str>, values: &BTreeMap<String, String>) -> Result<String> {
+        let values: BTreeMap<String, String> = values
+            .iter()
+            .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        if values.is_empty() {
+            bail!("nothing to configure");
+        }
+        let bag = self.backend.compose(&values);
+        if bag.is_empty() {
+            bail!("'{}' does not support configured profiles", self.backend.name());
+        }
+        let incoming = Profile::new(String::new(), bag);
+        let base = name
+            .filter(|n| !n.trim().is_empty())
+            .map(sanitize_name)
+            .or_else(|| incoming.email.as_deref().map(sanitize_name))
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "custom".to_string());
+        let name = self.unique_name(&base);
+        let profile = Profile { name: name.clone(), ..incoming };
+        save_profile(&self.dir, &profile)?;
+        let active_name = self.active.map(|i| self.profiles[i].name.clone());
+        self.profiles.push(profile);
+        self.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        self.active =
+            active_name.and_then(|n| self.profiles.iter().position(|p| p.name == n));
+        Ok(format!("configured '{name}'"))
+    }
+
     fn refresh(&mut self) -> Result<()> {
         self.absorb_live()
     }
@@ -294,7 +362,7 @@ impl<B: Backend> Provider for Swap<B> {
         self.profiles[idx].derive();
         save_profile(&self.dir, &self.profiles[idx])?;
         if self.active == Some(idx) {
-            self.backend.write_live(&self.profiles[idx].files)?;
+            self.write_surface(&self.profiles[idx].files)?;
         }
         Ok(())
     }
@@ -306,6 +374,13 @@ impl<B: Backend> Provider for Swap<B> {
 
 impl Profile {
     fn new(name: String, files: BTreeMap<String, String>) -> Self {
+        let files = files
+            .into_iter()
+            .map(|(k, v)| {
+                let v = if overlay::is_merge_key(&k) { overlay::canon_str(&v) } else { v };
+                (k, v)
+            })
+            .collect();
         let mut p = Profile { name, email: None, plan: None, identity: Vec::new(), files };
         p.derive();
         p
@@ -314,10 +389,14 @@ impl Profile {
     // whatever the files say about who this is - emails and account ids, JWT payloads included
     fn derive(&mut self) {
         let (mut emails, mut ids, mut plan) = (Vec::new(), Vec::new(), None);
+        let mut endpoint = None;
         for content in self.files.values() {
             let v: Value = match serde_json::from_str(content) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => match dotenv_json(content) {
+                    Some(v) => v,
+                    None => continue,
+                },
             };
             walk_values(&v, &mut |key: &str, val: &Value| {
                 let Some(s) = val.as_str() else { return };
@@ -332,11 +411,14 @@ impl Profile {
                 {
                     plan = Some(s.to_string());
                 }
+                if endpoint.is_none() && (key.contains("base_url") || key.contains("baseurl")) {
+                    endpoint = url_host(s);
+                }
             });
         }
         emails.sort();
         emails.dedup();
-        self.email = emails.first().cloned();
+        self.email = emails.first().cloned().or(endpoint);
         self.plan = plan;
         let mut identity = emails;
         identity.extend(ids);
@@ -344,6 +426,26 @@ impl Profile {
         identity.dedup();
         self.identity = identity;
     }
+}
+
+// KEY=VALUE lines as an object so derive can look inside env files
+fn dotenv_json(content: &str) -> Option<Value> {
+    let mut map = Map::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line.split_once('=')?;
+        map.insert(k.trim().to_string(), Value::from(v.trim()));
+    }
+    (!map.is_empty()).then(|| Value::Object(map))
+}
+
+fn url_host(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://"))?;
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn save_profile(dir: &Path, p: &Profile) -> Result<()> {
@@ -460,6 +562,38 @@ mod tests {
         let p = Profile::new("t".into(), files);
         assert_eq!(p.email.as_deref(), Some("me@mail.com"));
         assert_eq!(p.plan.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn derives_endpoint_host_for_configured_profiles() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "merge:~/.claude/settings.json".to_string(),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"sk-x"}}"#
+                .to_string(),
+        );
+        let p = Profile::new("t".into(), files);
+        assert_eq!(p.email.as_deref(), Some("api.z.ai"));
+        assert!(p.identity.is_empty());
+    }
+
+    #[test]
+    fn derives_from_dotenv_files() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "~/.gemini/.env".to_string(),
+            "GOOGLE_GEMINI_BASE_URL=https://g.example.com:8080/v1\nGEMINI_API_KEY=k\n".to_string(),
+        );
+        let p = Profile::new("t".into(), files);
+        assert_eq!(p.email.as_deref(), Some("g.example.com"));
+    }
+
+    #[test]
+    fn merge_values_are_canonicalized() {
+        let mut files = BTreeMap::new();
+        files.insert("merge:~/x.json".to_string(), r#"{"b":1,"a":2}"#.to_string());
+        let p = Profile::new("t".into(), files);
+        assert_eq!(p.files["merge:~/x.json"], r#"{"a":2,"b":1}"#);
     }
 
     #[test]

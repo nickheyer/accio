@@ -2,12 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
-use crate::fsutil::write_atomic;
+use crate::fsutil::{expand, write_atomic};
 use crate::usage::{parse_usage, Usage};
 use crate::{Job, Outcome};
 
@@ -74,13 +74,17 @@ fn facts(files: &BTreeMap<String, String>) -> Usage {
     parse_usage(&Value::Object(root))
 }
 
-fn expand(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
+// Knob values as one flat json object file
+pub fn compose_json(path: &str, values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let obj: Map<String, Value> =
+        values.iter().map(|(k, v)| (k.clone(), Value::from(v.as_str()))).collect();
+    BTreeMap::from([(path.to_string(), Value::Object(obj).to_string())])
+}
+
+// Knob values as KEY=VALUE lines
+pub fn compose_dotenv(path: &str, values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let body: String = values.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    BTreeMap::from([(path.to_string(), body)])
 }
 
 // creds files are wall to wall secrets - facts only keep what survives this

@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use accio_provider::{humanize_until, Account, Fetch, Outcome, Provider, Severity, Usage, Window};
+use accio_provider::{
+    humanize_until, Account, Fetch, Knob, Outcome, Provider, Severity, Usage, Window,
+};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*, DefaultTerminal};
@@ -22,7 +24,18 @@ struct FetchMsg {
 enum Mode {
     Normal,
     AddName(String),
+    AddMethod(Option<String>),
+    Configure(ConfigureForm),
     ConfirmDelete(String),
+}
+
+// One knob at a time, then free-form KEY=VALUE extras
+struct ConfigureForm {
+    name: Option<String>,
+    knobs: Vec<Knob>,
+    step: usize,
+    values: BTreeMap<String, String>,
+    input: String,
 }
 
 enum Action {
@@ -108,14 +121,75 @@ impl App {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Enter => {
                     let name = input.trim().to_string();
-                    self.mode = Mode::Normal;
-                    return Ok(Action::Add(if name.is_empty() { None } else { Some(name) }));
+                    let name = if name.is_empty() { None } else { Some(name) };
+                    if self.providers[self.tab].knobs().is_empty() {
+                        self.mode = Mode::Normal;
+                        return Ok(Action::Add(name));
+                    }
+                    self.mode = Mode::AddMethod(name);
                 }
                 KeyCode::Backspace => {
                     input.pop();
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     input.push(c);
+                }
+                _ => {}
+            },
+            Mode::AddMethod(name) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Char('l') | KeyCode::Enter => {
+                    let name = name.clone();
+                    self.mode = Mode::Normal;
+                    return Ok(Action::Add(name));
+                }
+                KeyCode::Char('c') => {
+                    let name = name.clone();
+                    self.mode = Mode::Configure(ConfigureForm {
+                        name,
+                        knobs: self.providers[self.tab].knobs(),
+                        step: 0,
+                        values: BTreeMap::new(),
+                        input: String::new(),
+                    });
+                }
+                _ => {}
+            },
+            Mode::Configure(form) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.status = "configure cancelled".into();
+                }
+                KeyCode::Enter => {
+                    let input = form.input.trim().to_string();
+                    form.input.clear();
+                    if form.step < form.knobs.len() {
+                        if !input.is_empty() {
+                            form.values.insert(form.knobs[form.step].name.clone(), input);
+                        }
+                        form.step += 1;
+                    } else if input.is_empty() {
+                        let name = form.name.clone();
+                        let values = std::mem::take(&mut form.values);
+                        self.mode = Mode::Normal;
+                        match self.providers[self.tab].configure(name.as_deref(), &values) {
+                            Ok(msg) => {
+                                self.status = msg;
+                                self.fetch_all();
+                            }
+                            Err(e) => self.status = format!("configure failed: {e:#}"),
+                        }
+                    } else if let Some((k, v)) = input.split_once('=') {
+                        if !k.trim().is_empty() {
+                            form.values.insert(k.trim().to_string(), v.trim().to_string());
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    form.input.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.input.push(c);
                 }
                 _ => {}
             },
@@ -407,6 +481,27 @@ impl App {
                 Span::raw(input.clone()),
                 Span::styled("▏", Style::new().dim()),
             ]),
+            Mode::AddMethod(_) => Line::from(vec![
+                Span::styled("add how? ", Style::new().bold()),
+                Span::raw("l = login, c = configure, esc = cancel"),
+            ]),
+            Mode::Configure(form) => {
+                let (label, hint) = match form.knobs.get(form.step) {
+                    Some(k) => (k.name.clone(), format!("{} - empty skips", k.hint)),
+                    None => ("extra env".to_string(), "KEY=VALUE - empty finishes".to_string()),
+                };
+                let shown = if form.knobs.get(form.step).is_some_and(|k| k.secret) {
+                    "*".repeat(form.input.chars().count())
+                } else {
+                    form.input.clone()
+                };
+                Line::from(vec![
+                    Span::styled(format!("{label} "), Style::new().bold()),
+                    Span::styled(format!("({hint}): "), Style::new().dim()),
+                    Span::raw(shown),
+                    Span::styled("▏", Style::new().dim()),
+                ])
+            }
             Mode::ConfirmDelete(name) => Line::styled(
                 format!("delete '{name}' from accio? (y/N)"),
                 Style::new().yellow().bold(),

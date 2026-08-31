@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use accio_provider::files;
-use accio_provider::{Backend, Job, Provider, Swap};
+use accio_provider::{Backend, Job, Knob, Provider, Swap};
 use anyhow::Result;
 
 const FILES: &[&str] = &["~/.grok/auth.json"];
@@ -38,5 +38,16 @@ impl Backend for Grok {
 
     fn info(&self) -> Vec<(String, String)> {
         files::info(FILES, LOGIN)
+    }
+
+    fn knobs(&self) -> Vec<Knob> {
+        vec![
+            Knob::secret("GROK_API_KEY", "api key stored in auth.json"),
+            Knob::new("GROK_BASE_URL", "endpoint override stored in auth.json"),
+        ]
+    }
+
+    fn compose(&self, values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        files::compose_json(FILES[0], values)
     }
 }

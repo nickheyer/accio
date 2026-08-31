@@ -1,5 +1,7 @@
 mod tui;
 
+use std::collections::BTreeMap;
+
 use accio_provider::Provider;
 use anyhow::{bail, Context, Result};
 
@@ -19,6 +21,7 @@ fn main() {
         None => tui::run(),
         Some("list") => cmd_list(),
         Some("add") => cmd_add(args.get(1), args.get(2)),
+        Some("configure") => cmd_configure(&args[1..]),
         Some("remove") => cmd_remove(args.get(1)),
         Some("help" | "-h" | "--help") => {
             print_help();
@@ -114,6 +117,43 @@ fn cmd_add(first: Option<&String>, second: Option<&String>) -> Result<()> {
     Ok(())
 }
 
+// store a profile from knob values instead of a login, eg claude behind a proxy
+fn cmd_configure(args: &[String]) -> Result<()> {
+    let provider = args
+        .first()
+        .context("usage: accio configure <provider> [name] KEY=VALUE...")?;
+    let mut providers = providers()?;
+    let pi = providers
+        .iter()
+        .position(|p| p.name() == provider.as_str())
+        .with_context(|| format!("no provider named '{provider}'"))?;
+    let mut name = None;
+    let mut values = BTreeMap::new();
+    for arg in &args[1..] {
+        match arg.split_once('=') {
+            Some((k, v)) => {
+                values.insert(k.to_string(), v.to_string());
+            }
+            None => name = Some(arg.as_str()),
+        }
+    }
+    if values.is_empty() {
+        let knobs = providers[pi].knobs();
+        if knobs.is_empty() {
+            bail!("'{provider}' has no configurable settings");
+        }
+        println!("knobs for {provider}. Any KEY=VALUE works, ex:\n");
+        for k in &knobs {
+            println!("  {:<28} {}", k.name, k.hint);
+        }
+        println!("\nusage: accio configure {provider} [name] KEY=VALUE...");
+        return Ok(());
+    }
+    let msg = providers[pi].configure(name, &values)?;
+    println!("{msg}");
+    Ok(())
+}
+
 fn cmd_remove(name: Option<&String>) -> Result<()> {
     let spec = name.context("usage: accio remove <name>")?;
     let mut providers = providers()?;
@@ -129,11 +169,12 @@ fn print_help() {
         "accio - switch between provider accounts without re-auth
 
 usage:
-  accio                                open the TUI
-  accio <your other account>           make account the live account (provider/name if ambiguous)
-  accio list                           list accounts
-  accio add [provider] [name]          add currently logged in account or log one in if specified
-  accio remove <your other account>    remove an account from accio
-  accio help                           show this help"
+  accio                                           open the TUI
+  accio <your other account>                      make account the live account (provider/name if ambiguous)
+  accio list                                      list accounts
+  accio add [provider] [name]                     add currently logged in account or log one in if specified
+  accio configure <provider> [name] KEY=VALUE...  for advance profile configuration
+  accio remove <your other account>               remove an account from accio
+  accio help                                      show this help"
     );
 }
