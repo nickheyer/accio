@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "accio"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "accio-claude",
  "accio-codex",
@@ -18,7 +18,7 @@ dependencies = [
 
 [[package]]
 name = "accio-claude"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "accio-codex"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "accio-gemini"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "accio-grok"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "accio-provider"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "chrono",
