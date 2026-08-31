@@ -13,8 +13,16 @@ EZ ai credentials/config switcheroo. No slop features, no dashboard, just accio 
 
 ## Install
 
+With cargo (any os):
+
+```sh
+cargo install --git https://github.com/nickheyer/accio accio
 ```
-cargo install --path .
+
+On Arch:
+
+```sh
+yay -S accio
 ```
 
 ## Stuff
