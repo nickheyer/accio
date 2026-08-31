@@ -41,7 +41,10 @@ impl Backend for Codex {
     }
 
     fn knobs(&self) -> Vec<Knob> {
-        vec![Knob::secret("OPENAI_API_KEY", "api key stored in auth.json")]
+        vec![Knob::secret(
+            "OPENAI_API_KEY",
+            "api key stored in auth.json",
+        )]
     }
 
     fn compose(&self, values: &BTreeMap<String, String>) -> BTreeMap<String, String> {

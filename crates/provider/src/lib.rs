@@ -25,11 +25,19 @@ pub struct Knob {
 
 impl Knob {
     pub fn new(name: &str, hint: &str) -> Self {
-        Knob { name: name.to_string(), hint: hint.to_string(), secret: false }
+        Knob {
+            name: name.to_string(),
+            hint: hint.to_string(),
+            secret: false,
+        }
     }
 
     pub fn secret(name: &str, hint: &str) -> Self {
-        Knob { name: name.to_string(), hint: hint.to_string(), secret: true }
+        Knob {
+            name: name.to_string(),
+            hint: hint.to_string(),
+            secret: true,
+        }
     }
 }
 
@@ -66,8 +74,17 @@ pub trait Provider {
     }
 
     // store a profile built from knob values, nothing goes live yet
-    fn configure(&mut self, _name: Option<&str>, _values: &BTreeMap<String, String>) -> Result<String> {
+    fn configure(
+        &mut self,
+        _name: Option<&str>,
+        _values: &BTreeMap<String, String>,
+    ) -> Result<String> {
         bail!("'{}' does not support configured profiles", self.name())
+    }
+
+    // configure editable profile, empty when not editable
+    fn values(&self, _name: &str) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 
     // pick up whatever changed on disk since we last looked

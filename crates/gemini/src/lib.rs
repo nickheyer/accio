@@ -6,7 +6,10 @@ use accio_provider::files;
 use accio_provider::{Backend, Job, Knob, Provider, Swap};
 use anyhow::Result;
 
-const FILES: &[&str] = &["~/.gemini/oauth_creds.json", "~/.gemini/google_accounts.json"];
+const FILES: &[&str] = &[
+    "~/.gemini/oauth_creds.json",
+    "~/.gemini/google_accounts.json",
+];
 const LOGIN: &[&str] = &["gemini"];
 const ENV_FILE: &str = "~/.gemini/.env";
 

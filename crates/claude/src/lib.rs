@@ -29,18 +29,20 @@ struct Claude {
 impl Claude {
     fn locate() -> Result<Self> {
         let home = dirs::home_dir().context("cant determine home dir")?;
-        let (claude_dir, claude_json_path, settings_key) = match std::env::var_os("CLAUDE_CONFIG_DIR")
-        {
-            Some(dir) => {
-                let dir = PathBuf::from(dir);
-                let json = dir.join(".claude.json");
-                let settings = dir.join("settings.json").display().to_string();
-                (dir, json, settings)
-            }
-            None => {
-                (home.join(".claude"), home.join(".claude.json"), "~/.claude/settings.json".into())
-            }
-        };
+        let (claude_dir, claude_json_path, settings_key) =
+            match std::env::var_os("CLAUDE_CONFIG_DIR") {
+                Some(dir) => {
+                    let dir = PathBuf::from(dir);
+                    let json = dir.join(".claude.json");
+                    let settings = dir.join("settings.json").display().to_string();
+                    (dir, json, settings)
+                }
+                None => (
+                    home.join(".claude"),
+                    home.join(".claude.json"),
+                    "~/.claude/settings.json".into(),
+                ),
+            };
         Ok(Claude {
             creds_path: claude_dir.join(".credentials.json"),
             claude_json_path,
@@ -131,15 +133,22 @@ impl Backend for Claude {
 
     fn fetch(&self, files: BTreeMap<String, String>) -> Job {
         Box::new(move || {
-            let mut creds: Value =
-                match files.get("credentials").and_then(|s| serde_json::from_str(s).ok()) {
-                    Some(v) => v,
-                    // configured profiles have no oauth, show their facts instead
-                    None => return files::facts_job(files)(),
-                };
+            let mut creds: Value = match files
+                .get("credentials")
+                .and_then(|s| serde_json::from_str(s).ok())
+            {
+                Some(v) => v,
+                // configured profiles have no oauth, show their facts instead
+                None => return files::facts_job(files)(),
+            };
             let refreshed = match oauth::ensure_fresh(&mut creds) {
                 Ok(r) => r,
-                Err(e) => return Outcome { usage: Err(format!("{e:#}")), state: None },
+                Err(e) => {
+                    return Outcome {
+                        usage: Err(format!("{e:#}")),
+                        state: None,
+                    }
+                }
             };
             let token = creds
                 .pointer("/claudeAiOauth/accessToken")
@@ -157,7 +166,10 @@ impl Backend for Claude {
                 }
                 Err(e) => Err(format!("{e:#}")),
             };
-            Outcome { usage, state: refreshed.then(|| json!({ "credentials": creds.to_string() })) }
+            Outcome {
+                usage,
+                state: refreshed.then(|| json!({ "credentials": creds.to_string() })),
+            }
         })
     }
 }
@@ -252,7 +264,16 @@ fn keychain_read() -> Option<Value> {
 fn keychain_write(body: &str) -> Result<()> {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let out = std::process::Command::new("security")
-        .args(["add-generic-password", "-U", "-a", &user, "-s", KEYCHAIN_SERVICE, "-w", body])
+        .args([
+            "add-generic-password",
+            "-U",
+            "-a",
+            &user,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+            body,
+        ])
         .output()
         .context("cant run `security`")?;
     if !out.status.success() {

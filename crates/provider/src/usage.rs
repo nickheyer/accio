@@ -37,8 +37,11 @@ pub fn parse_usage(v: &Value) -> Usage {
     walk(v, &mut Vec::new(), &mut usage);
     usage.windows = merge_duplicates(usage.windows);
     usage.windows.sort_by(|a, b| {
-        (a.resets_at.is_none(), a.resets_at, &a.label)
-            .cmp(&(b.resets_at.is_none(), b.resets_at, &b.label))
+        (a.resets_at.is_none(), a.resets_at, &a.label).cmp(&(
+            b.resets_at.is_none(),
+            b.resets_at,
+            &b.label,
+        ))
     });
     usage
 }
@@ -116,7 +119,11 @@ fn fact_from(v: &Value, path: &[&str]) -> Option<Fact> {
         _ => return None,
     };
     Some(Fact {
-        label: path.iter().map(|k| humanize(k)).collect::<Vec<_>>().join(" · "),
+        label: path
+            .iter()
+            .map(|k| humanize(k))
+            .collect::<Vec<_>>()
+            .join(" · "),
         value,
     })
 }
@@ -190,9 +197,12 @@ fn parse_severity(v: Option<&str>, percent: f64) -> Severity {
 fn parse_time(v: Option<&Value>) -> Option<DateTime<Utc>> {
     let v = v?;
     if let Some(s) = v.as_str() {
-        return DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc));
+        return DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&Utc));
     }
-    v.as_i64().and_then(|secs| DateTime::from_timestamp(secs, 0))
+    v.as_i64()
+        .and_then(|secs| DateTime::from_timestamp(secs, 0))
 }
 
 pub fn humanize_until(t: DateTime<Utc>) -> String {
@@ -261,7 +271,12 @@ mod tests {
         let labels: Vec<&str> = facts.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["organization · tier", "organization · seats", "extra usage · is enabled", "extra usage · spend · amount"]
+            [
+                "organization · tier",
+                "organization · seats",
+                "extra usage · is enabled",
+                "extra usage · spend · amount"
+            ]
         );
         assert_eq!(facts[1].value, "3");
         assert_eq!(facts[2].value, "no");
@@ -270,7 +285,9 @@ mod tests {
 
     #[test]
     fn unknown_shape_yields_empty_not_panic() {
-        assert!(parse_usage(&serde_json::json!({"whatever": 3})).windows.is_empty());
+        assert!(parse_usage(&serde_json::json!({"whatever": 3}))
+            .windows
+            .is_empty());
         assert!(parse_usage(&serde_json::json!([1, 2])).windows.is_empty());
         assert!(parse_usage(&serde_json::json!([1, 2])).facts.is_empty());
     }

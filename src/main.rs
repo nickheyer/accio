@@ -82,7 +82,11 @@ fn resolve(providers: &[Box<dyn Provider>], spec: &str) -> Result<(usize, usize)
             let names: Vec<String> = many
                 .iter()
                 .map(|&(pi, ai)| {
-                    format!("{}/{}", providers[pi].name(), providers[pi].accounts()[ai].name)
+                    format!(
+                        "{}/{}",
+                        providers[pi].name(),
+                        providers[pi].accounts()[ai].name
+                    )
                 })
                 .collect();
             bail!("'{spec}' is ambiguous - try one of: {}", names.join(", "))

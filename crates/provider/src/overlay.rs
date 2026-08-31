@@ -113,9 +113,7 @@ pub fn write(spec: &Spec, incoming: &BTreeMap<String, String>) -> Result<()> {
                 .with_context(|| format!("bad merge content for {mpath}"))?;
             deep_merge(&mut doc, &patch);
         }
-        if (existed && doc == before)
-            || (!existed && doc.as_object().is_some_and(Map::is_empty))
-        {
+        if (existed && doc == before) || (!existed && doc.as_object().is_some_and(Map::is_empty)) {
             continue;
         }
         if let Some(parent) = path.parent() {
@@ -133,7 +131,12 @@ pub fn canon(v: &Value) -> Value {
         Value::Object(map) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(k, _)| k.as_str());
-            Value::Object(entries.into_iter().map(|(k, v)| (k.clone(), canon(v))).collect())
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), canon(v)))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.iter().map(canon).collect()),
         other => other.clone(),
@@ -196,7 +199,9 @@ fn set_chain(doc: &mut Value, chain: &[String], val: Value) {
 
 // Remove the leaf then prune parents it emptied
 fn remove_chain(doc: &mut Value, chain: &[String]) {
-    let Some(map) = doc.as_object_mut() else { return };
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
     match chain {
         [] => {}
         [leaf] => {
@@ -242,7 +247,10 @@ mod tests {
         fs::write(&settings, r#"{"theme":"dark","env":{"MINE":"keep"}}"#).unwrap();
         let key = format!("merge:{}", settings.display());
         let mut bag = BTreeMap::new();
-        bag.insert(key.clone(), r#"{"env":{"X_BASE_URL":"https://a.example"}}"#.to_string());
+        bag.insert(
+            key.clone(),
+            r#"{"env":{"X_BASE_URL":"https://a.example"}}"#.to_string(),
+        );
         let mut spec = Spec::default();
         spec.add(&bag);
 
@@ -276,7 +284,10 @@ mod tests {
 
     #[test]
     fn canon_orders_keys() {
-        assert_eq!(canon_str(r#"{"b":1,"a":{"d":[2],"c":3}}"#), r#"{"a":{"c":3,"d":[2]},"b":1}"#);
+        assert_eq!(
+            canon_str(r#"{"b":1,"a":{"d":[2],"c":3}}"#),
+            r#"{"a":{"c":3,"d":[2]},"b":1}"#
+        );
     }
 
     #[test]

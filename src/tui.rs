@@ -23,19 +23,128 @@ struct FetchMsg {
 
 enum Mode {
     Normal,
-    AddName(String),
-    AddMethod(Option<String>),
-    Configure(ConfigureForm),
+    AddMethod(usize),
+    Form(Form),
     ConfirmDelete(String),
 }
 
-// One knob at a time, then free-form KEY=VALUE extras
-struct ConfigureForm {
-    name: Option<String>,
-    knobs: Vec<Knob>,
-    step: usize,
-    values: BTreeMap<String, String>,
-    input: String,
+const ADD_METHODS: [&str; 2] = [
+    "log in with the provider cli",
+    "configure an endpoint or key",
+];
+
+// All fields visible at once, hints live inside the inputs
+struct Form {
+    title: String,
+    fields: Vec<Field>,
+    focus: usize,
+    action: FormAction,
+}
+
+enum FormAction {
+    Login,
+    Configure { editing: Option<String> },
+}
+
+struct Field {
+    label: String,
+    hint: String,
+    value: String,
+    secret: bool,
+    extra: bool,
+}
+
+impl Field {
+    fn knob(k: &Knob) -> Self {
+        Field {
+            label: k.name.clone(),
+            hint: format!("{} (optional)", k.hint),
+            value: String::new(),
+            secret: k.secret,
+            extra: false,
+        }
+    }
+
+    fn extra() -> Self {
+        Field {
+            label: "extra".to_string(),
+            hint: "KEY=VALUE (optional)".to_string(),
+            value: String::new(),
+            secret: false,
+            extra: true,
+        }
+    }
+}
+
+impl Form {
+    fn login(provider: &str) -> Self {
+        Form {
+            title: format!(" add {provider} account "),
+            fields: vec![Field {
+                label: "name".to_string(),
+                hint: "defaults to the account email".to_string(),
+                value: String::new(),
+                secret: false,
+                extra: false,
+            }],
+            focus: 0,
+            action: FormAction::Login,
+        }
+    }
+
+    fn configure(provider: &str, knobs: &[Knob]) -> Self {
+        let mut fields = vec![Field {
+            label: "name".to_string(),
+            hint: "defaults to the endpoint host".to_string(),
+            value: String::new(),
+            secret: false,
+            extra: false,
+        }];
+        fields.extend(knobs.iter().map(Field::knob));
+        fields.push(Field::extra());
+        Form {
+            title: format!(" configure {provider} profile "),
+            fields,
+            focus: 0,
+            action: FormAction::Configure { editing: None },
+        }
+    }
+
+    fn edit(name: &str, knobs: &[Knob], mut values: BTreeMap<String, String>) -> Self {
+        let mut fields: Vec<Field> = knobs
+            .iter()
+            .map(|k| {
+                let mut f = Field::knob(k);
+                f.value = values.remove(&k.name).unwrap_or_default();
+                f
+            })
+            .collect();
+        for (k, v) in values {
+            let mut f = Field::extra();
+            f.value = format!("{k}={v}");
+            fields.push(f);
+        }
+        fields.push(Field::extra());
+        Form {
+            title: format!(" edit '{name}' "),
+            fields,
+            focus: 0,
+            action: FormAction::Configure {
+                editing: Some(name.to_string()),
+            },
+        }
+    }
+
+    // Filled last extra row spawns a fresh one below
+    fn grow(&mut self) {
+        if self
+            .fields
+            .last()
+            .is_some_and(|f| f.extra && !f.value.trim().is_empty())
+        {
+            self.fields.push(Field::extra());
+        }
+    }
 }
 
 enum Action {
@@ -117,79 +226,55 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> Result<Action> {
         match &mut self.mode {
             Mode::Normal => return self.on_key_normal(key),
-            Mode::AddName(input) => match key.code {
+            Mode::AddMethod(selected) => match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Enter => {
-                    let name = input.trim().to_string();
-                    let name = if name.is_empty() { None } else { Some(name) };
-                    if self.providers[self.tab].knobs().is_empty() {
-                        self.mode = Mode::Normal;
-                        return Ok(Action::Add(name));
-                    }
-                    self.mode = Mode::AddMethod(name);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    input.push(c);
-                }
-                _ => {}
-            },
-            Mode::AddMethod(name) => match key.code {
-                KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Char('l') | KeyCode::Enter => {
-                    let name = name.clone();
-                    self.mode = Mode::Normal;
-                    return Ok(Action::Add(name));
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Char('k')
+                | KeyCode::Tab => *selected = 1 - *selected,
+                KeyCode::Char('l') => {
+                    self.mode = Mode::Form(Form::login(self.providers[self.tab].name()));
                 }
                 KeyCode::Char('c') => {
-                    let name = name.clone();
-                    self.mode = Mode::Configure(ConfigureForm {
-                        name,
-                        knobs: self.providers[self.tab].knobs(),
-                        step: 0,
-                        values: BTreeMap::new(),
-                        input: String::new(),
-                    });
+                    let p = &self.providers[self.tab];
+                    self.mode = Mode::Form(Form::configure(p.name(), &p.knobs()));
+                }
+                KeyCode::Enter => {
+                    let p = &self.providers[self.tab];
+                    self.mode = if *selected == 0 {
+                        Mode::Form(Form::login(p.name()))
+                    } else {
+                        Mode::Form(Form::configure(p.name(), &p.knobs()))
+                    };
                 }
                 _ => {}
             },
-            Mode::Configure(form) => match key.code {
+            Mode::Form(form) => match key.code {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
-                    self.status = "configure cancelled".into();
+                    self.status = "cancelled".into();
+                }
+                KeyCode::Up | KeyCode::BackTab => form.focus = form.focus.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => {
+                    form.grow();
+                    if form.focus + 1 < form.fields.len() {
+                        form.focus += 1;
+                    }
                 }
                 KeyCode::Enter => {
-                    let input = form.input.trim().to_string();
-                    form.input.clear();
-                    if form.step < form.knobs.len() {
-                        if !input.is_empty() {
-                            form.values.insert(form.knobs[form.step].name.clone(), input);
-                        }
-                        form.step += 1;
-                    } else if input.is_empty() {
-                        let name = form.name.clone();
-                        let values = std::mem::take(&mut form.values);
-                        self.mode = Mode::Normal;
-                        match self.providers[self.tab].configure(name.as_deref(), &values) {
-                            Ok(msg) => {
-                                self.status = msg;
-                                self.fetch_all();
-                            }
-                            Err(e) => self.status = format!("configure failed: {e:#}"),
-                        }
-                    } else if let Some((k, v)) = input.split_once('=') {
-                        if !k.trim().is_empty() {
-                            form.values.insert(k.trim().to_string(), v.trim().to_string());
-                        }
+                    form.grow();
+                    if form.focus + 1 < form.fields.len() {
+                        form.focus += 1;
+                    } else {
+                        return self.submit_form();
                     }
                 }
                 KeyCode::Backspace => {
-                    form.input.pop();
+                    form.fields[form.focus].value.pop();
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    form.input.push(c);
+                    form.fields[form.focus].value.push(c);
                 }
                 _ => {}
             },
@@ -211,6 +296,59 @@ impl App {
             }
         }
         Ok(Action::None)
+    }
+
+    fn submit_form(&mut self) -> Result<Action> {
+        let form = match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Form(f) => f,
+            other => {
+                self.mode = other;
+                return Ok(Action::None);
+            }
+        };
+        let field_value = |f: &Field| {
+            let v = f.value.trim().to_string();
+            (!v.is_empty()).then_some(v)
+        };
+        match form.action {
+            FormAction::Login => Ok(Action::Add(form.fields.first().and_then(field_value))),
+            FormAction::Configure { editing } => {
+                let mut name = editing;
+                let mut values = BTreeMap::new();
+                for f in &form.fields {
+                    let Some(v) = field_value(f) else { continue };
+                    if f.extra {
+                        if let Some((k, v)) = v.split_once('=') {
+                            if !k.trim().is_empty() {
+                                values.insert(k.trim().to_string(), v.trim().to_string());
+                            }
+                        }
+                    } else if f.label == "name" && name.is_none() {
+                        name = Some(v);
+                    } else if f.label != "name" {
+                        values.insert(f.label.clone(), v);
+                    }
+                }
+                match self.providers[self.tab].configure(name.as_deref(), &values) {
+                    Ok(msg) => {
+                        // Land the selection on the profile the message names
+                        if let Some(n) = msg.split('\'').nth(1) {
+                            if let Some(i) = self.providers[self.tab]
+                                .accounts()
+                                .iter()
+                                .position(|a| a.name == n)
+                            {
+                                self.selected[self.tab] = i;
+                            }
+                        }
+                        self.status = msg;
+                        self.fetch_all();
+                    }
+                    Err(e) => self.status = format!("configure failed: {e:#}"),
+                }
+                Ok(Action::None)
+            }
+        }
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> Result<Action> {
@@ -259,7 +397,33 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('a') => self.mode = Mode::AddName(String::new()),
+            KeyCode::Char('a') => {
+                let p = &self.providers[self.tab];
+                self.mode = if p.knobs().is_empty() {
+                    Mode::Form(Form::login(p.name()))
+                } else {
+                    Mode::AddMethod(0)
+                };
+            }
+            KeyCode::Char('e') => {
+                if n == 0 {
+                    return Ok(Action::None);
+                }
+                let p = &self.providers[self.tab];
+                let name = p
+                    .accounts()
+                    .get(self.selected[self.tab])
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default();
+                let values = p.values(&name);
+                if values.is_empty() {
+                    self.status = format!(
+                        "'{name}' is a login account - only configured profiles are editable"
+                    );
+                } else {
+                    self.mode = Mode::Form(Form::edit(&name, &p.knobs(), values));
+                }
+            }
             KeyCode::Char('d') => {
                 if n == 0 {
                     return Ok(Action::None);
@@ -270,7 +434,10 @@ impl App {
                     self.status = "can't delete the active account - switch away first".into();
                 } else {
                     self.mode = Mode::ConfirmDelete(
-                        p.accounts().get(sel).map(|a| a.name.clone()).unwrap_or_default(),
+                        p.accounts()
+                            .get(sel)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_default(),
                     );
                 }
             }
@@ -301,10 +468,15 @@ impl App {
                 self.status = format!("{}: {e:#}", self.providers[pi].name());
             }
             for Fetch { account, job } in self.providers[pi].fetches() {
-                self.usage.insert((pi, account.clone()), UsageState::Loading);
+                self.usage
+                    .insert((pi, account.clone()), UsageState::Loading);
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(FetchMsg { provider: pi, account, outcome: job() });
+                    let _ = tx.send(FetchMsg {
+                        provider: pi,
+                        account,
+                        outcome: job(),
+                    });
                 });
             }
         }
@@ -345,6 +517,44 @@ impl App {
         self.render_accounts(f, accounts_area);
         self.render_usage(f, usage_area);
         self.render_footer(f, footer_area);
+        match &self.mode {
+            Mode::AddMethod(selected) => self.render_menu(f, *selected),
+            Mode::Form(form) => render_form(f, form),
+            _ => {}
+        }
+    }
+
+    fn render_menu(&self, f: &mut Frame, selected: usize) {
+        let rect = centered(f.area(), 46, 6);
+        f.render_widget(Clear, rect);
+        let mut lines: Vec<Line> = ADD_METHODS
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let (marker, style) = if i == selected {
+                    ("▶ ", Style::new().bold())
+                } else {
+                    ("  ", Style::new())
+                };
+                Line::from(vec![
+                    Span::raw(marker),
+                    Span::styled(format!("{}  ", ['l', 'c'][i]), Style::new().dim()),
+                    Span::styled(m.to_string(), style),
+                ])
+            })
+            .collect();
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "enter select · esc cancel",
+            Style::new().dim(),
+        ));
+        f.render_widget(
+            Paragraph::new(lines).block(panel(format!(
+                " add {} account ",
+                self.providers[self.tab].name()
+            ))),
+            rect,
+        );
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
@@ -367,8 +577,18 @@ impl App {
         let p = &self.providers[self.tab];
         let rows = p.accounts();
         let name_w = column(&rows, |r| r.name.chars().count(), 4, 18);
-        let mail_w = column(&rows, |r| r.email.as_deref().unwrap_or("-").chars().count(), 5, 30);
-        let plan_w = column(&rows, |r| r.plan.as_deref().unwrap_or("").chars().count(), 3, 12);
+        let mail_w = column(
+            &rows,
+            |r| r.email.as_deref().unwrap_or("-").chars().count(),
+            5,
+            30,
+        );
+        let plan_w = column(
+            &rows,
+            |r| r.plan.as_deref().unwrap_or("").chars().count(),
+            3,
+            12,
+        );
 
         let items: Vec<ListItem> = if rows.is_empty() {
             vec![ListItem::new(Line::styled(
@@ -383,7 +603,11 @@ impl App {
                     let left = vec![
                         Span::styled(
                             pad(&r.name, name_w),
-                            if active { Style::new().green().bold() } else { Style::new() },
+                            if active {
+                                Style::new().green().bold()
+                            } else {
+                                Style::new()
+                            },
                         ),
                         Span::raw("  "),
                         Span::styled(
@@ -462,7 +686,10 @@ impl App {
                     vec![Line::styled("fetching…", Style::new().dim())]
                 }
                 Some(UsageState::Error(e)) => {
-                    vec![Line::styled(format!("unavailable: {e}"), Style::new().red())]
+                    vec![Line::styled(
+                        format!("unavailable: {e}"),
+                        Style::new().red(),
+                    )]
                 }
                 Some(UsageState::Ready(u)) if u.windows.is_empty() && u.facts.is_empty() => {
                     vec![Line::styled("nothing to show", Style::new().dim())]
@@ -476,47 +703,103 @@ impl App {
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let top_line = match &self.mode {
-            Mode::AddName(input) => Line::from(vec![
-                Span::styled("name for new account (empty = from email): ", Style::new().bold()),
-                Span::raw(input.clone()),
-                Span::styled("▏", Style::new().dim()),
-            ]),
-            Mode::AddMethod(_) => Line::from(vec![
-                Span::styled("add how? ", Style::new().bold()),
-                Span::raw("l = login, c = configure, esc = cancel"),
-            ]),
-            Mode::Configure(form) => {
-                let (label, hint) = match form.knobs.get(form.step) {
-                    Some(k) => (k.name.clone(), format!("{} - empty skips", k.hint)),
-                    None => ("extra env".to_string(), "KEY=VALUE - empty finishes".to_string()),
-                };
-                let shown = if form.knobs.get(form.step).is_some_and(|k| k.secret) {
-                    "*".repeat(form.input.chars().count())
-                } else {
-                    form.input.clone()
-                };
-                Line::from(vec![
-                    Span::styled(format!("{label} "), Style::new().bold()),
-                    Span::styled(format!("({hint}): "), Style::new().dim()),
-                    Span::raw(shown),
-                    Span::styled("▏", Style::new().dim()),
-                ])
-            }
             Mode::ConfirmDelete(name) => Line::styled(
                 format!("delete '{name}' from accio? (y/N)"),
                 Style::new().yellow().bold(),
             ),
-            Mode::Normal => Line::styled(self.status.clone(), Style::new().cyan()),
+            _ => Line::styled(self.status.clone(), Style::new().cyan()),
         };
         let help = Line::styled(
-            "←/→ provider · ↑/↓ select · enter switch · a add · d delete · r refresh · q quit",
+            "←/→ provider · ↑/↓ select · enter switch · a add · e edit · d delete · r refresh · q quit",
             Style::new().dim(),
         );
         f.render_widget(
-            Paragraph::new(vec![top_line, help]).block(Block::new().padding(Padding::horizontal(2))),
+            Paragraph::new(vec![top_line, help])
+                .block(Block::new().padding(Padding::horizontal(2))),
             area,
         );
     }
+}
+
+fn render_form(f: &mut Frame, form: &Form) {
+    let label_w = form
+        .fields
+        .iter()
+        .map(|fl| fl.label.chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 26);
+    let rect = centered(f.area(), 66, form.fields.len() as u16 + 4);
+    f.render_widget(Clear, rect);
+    // borders, padding, marker, label and the gap after it
+    let value_w = (rect.width as usize)
+        .saturating_sub(4 + 2 + label_w + 2)
+        .max(8);
+
+    let mut lines: Vec<Line> = form
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, fl)| {
+            let focused = i == form.focus;
+            let marker = if focused { "▶ " } else { "  " };
+            let label_style = if focused {
+                Style::new().bold()
+            } else {
+                Style::new().dim()
+            };
+            let mut spans = vec![
+                Span::styled(marker.to_string(), Style::new().cyan()),
+                Span::styled(pad(&fl.label, label_w), label_style),
+                Span::raw("  "),
+            ];
+            if fl.value.is_empty() {
+                spans.push(Span::styled(
+                    clip(&fl.hint, value_w),
+                    Style::new().dim().italic(),
+                ));
+            } else {
+                let shown = if fl.secret {
+                    "*".repeat(fl.value.chars().count())
+                } else {
+                    fl.value.clone()
+                };
+                spans.push(Span::raw(tail(&shown, value_w)));
+            }
+            if focused {
+                spans.push(Span::styled("▏", Style::new().dim()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "↑/↓ field · enter next, saves on last · esc cancel",
+        Style::new().dim(),
+    ));
+    f.render_widget(Paragraph::new(lines).block(panel(form.title.clone())), rect);
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width.saturating_sub(2));
+    let h = height.min(area.height.saturating_sub(2));
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+// Keep the end of a long value in view while typing
+fn tail(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    std::iter::once('…')
+        .chain(s.chars().skip(n.saturating_sub(width.saturating_sub(1))))
+        .collect()
 }
 
 // What an empty provider tab manages, straight from the provider itself
@@ -525,7 +808,12 @@ fn info_lines(p: &dyn Provider) -> Vec<Line<'static>> {
     if info.is_empty() {
         return Vec::new();
     }
-    let label_w = info.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0).clamp(4, 12);
+    let label_w = info
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 12);
     let mut lines = vec![Line::raw("")];
     lines.extend(info.iter().map(|(l, v)| {
         Line::from(vec![
@@ -565,7 +853,10 @@ fn usage_lines(u: &Usage, width: usize) -> Vec<Line<'static>> {
         let head = "── details ";
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("{head}{}", "─".repeat(width.saturating_sub(head.chars().count()))),
+            format!(
+                "{head}{}",
+                "─".repeat(width.saturating_sub(head.chars().count()))
+            ),
             Style::new().dark_gray(),
         ));
         let fact_w = u
@@ -655,5 +946,8 @@ fn clip(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
     }
-    s.chars().take(width.saturating_sub(1)).chain(['…']).collect()
+    s.chars()
+        .take(width.saturating_sub(1))
+        .chain(['…'])
+        .collect()
 }

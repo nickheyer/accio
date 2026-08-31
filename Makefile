@@ -1,7 +1,7 @@
 .PHONY: test build dev release
 
 test:
-	cargo test
+	cargo test --workspace
 
 build:
 	cargo build --release
