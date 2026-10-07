@@ -1,3 +1,4 @@
+mod launch;
 mod tui;
 
 use std::collections::BTreeMap;
@@ -16,8 +17,27 @@ fn providers() -> Result<Vec<Box<dyn Provider>>> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.first().map(String::as_str) {
+    if let Err(e) = run() {
+        eprintln!("accio: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(name @ ("claude" | "codex" | "grok" | "gemini")) =
+        args.first().and_then(|a| a.to_str())
+    {
+        return launch::run(name, &args[1..]);
+    }
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|a| {
+            a.into_string()
+                .map_err(|_| anyhow::anyhow!("account commands require UTF-8 arguments"))
+        })
+        .collect::<Result<_>>()?;
+    match args.first().map(String::as_str) {
         None => tui::run(),
         Some("list") => cmd_list(),
         Some("add") => cmd_add(args.get(1), args.get(2)),
@@ -28,10 +48,6 @@ fn main() {
             Ok(())
         }
         Some(name) => cmd_switch(name),
-    };
-    if let Err(e) = result {
-        eprintln!("accio: {e:#}");
-        std::process::exit(1);
     }
 }
 
@@ -174,6 +190,7 @@ fn print_help() {
 
 usage:
   accio                                           open the TUI
+  accio <provider> [--profile NAME] [--] [ARGS...] launch a harness with session-only credentials
   accio <your other account>                      make account the live account (provider/name if ambiguous)
   accio list                                      list accounts
   accio add [provider] [name]                     add currently logged in account or log one in if specified

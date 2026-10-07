@@ -3,7 +3,8 @@ EZ ai credentials/config switcheroo. No slop features, no dashboard, just accio 
 
 ```
   accio                                           open the TUI
-  accio <your other account>                      make account the live account (provider/name if ambiguous)
+  accio <provider> [--profile NAME] [--] [args]   launch as session
+  accio <your other account>                      set live account
   accio list                                      list accounts
   accio add [provider] [name]                     add currently logged in account or log one in if specified
   accio configure <provider> [name] KEY=VALUE...  for advance profile configuration
@@ -45,3 +46,23 @@ accio configure claude zai ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANT
 accio zai
 ```
 
+## Isolated sessions
+
+Launch a harness with a saved profile without switching its default account:
+
+```sh
+accio claude
+accio codex
+accio gemini
+accio grok
+```
+
+Skip the picker with `--profile`, and pass arguments to the harness after `--`:
+
+```sh
+accio claude --profile work
+accio claude --profile personal -- -p "are you sentient"
+accio codex --profile work -- exec "Run the tests"
+accio gemini --profile personal -- -p "why is gemini so bad"
+accio grok --profile work
+```

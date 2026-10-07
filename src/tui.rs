@@ -151,14 +151,38 @@ enum Action {
     None,
     Quit,
     Add(Option<String>),
+    Launch(usize),
 }
 
 pub fn run() -> Result<()> {
     let providers = crate::providers()?;
     let mut terminal = ratatui::init();
-    let result = App::new(providers).run(&mut terminal);
+    let result = App::new(providers).run(&mut terminal).map(|_| ());
     ratatui::restore();
     result
+}
+
+pub fn pick_session(provider: Box<dyn Provider>) -> Result<Option<(Box<dyn Provider>, usize)>> {
+    anyhow::ensure!(
+        !provider.accounts().is_empty(),
+        "no saved {} profiles - run `accio add {}` or `accio configure {}` first",
+        provider.name(),
+        provider.name(),
+        provider.name()
+    );
+    use std::io::IsTerminal;
+    anyhow::ensure!(
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        "the profile picker needs a terminal - use `accio {} --profile NAME` instead",
+        provider.name()
+    );
+    let mut app = App::new(vec![provider]);
+    app.session_picker = true;
+    app.status = "Choose a profile for this session".into();
+    let mut terminal = ratatui::init();
+    let result = app.run(&mut terminal);
+    ratatui::restore();
+    Ok(result?.map(|idx| (app.providers.remove(0), idx)))
 }
 
 struct App {
@@ -170,6 +194,7 @@ struct App {
     status: String,
     tx: Sender<FetchMsg>,
     rx: Receiver<FetchMsg>,
+    session_picker: bool,
 }
 
 impl App {
@@ -185,10 +210,11 @@ impl App {
             status: String::new(),
             tx,
             rx,
+            session_picker: false,
         }
     }
 
-    fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<usize>> {
         self.fetch_all();
         loop {
             self.drain_fetches();
@@ -202,7 +228,8 @@ impl App {
                 _ => continue,
             };
             match self.on_key(key)? {
-                Action::Quit => return Ok(()),
+                Action::Quit => return Ok(None),
+                Action::Launch(idx) => return Ok(Some(idx)),
                 Action::Add(name) => {
                     // Leave the TUI entirely while the provider's own login runs.
                     ratatui::restore();
@@ -379,6 +406,9 @@ impl App {
                     return Ok(Action::None);
                 }
                 let sel = self.selected[self.tab];
+                if self.session_picker {
+                    return Ok(Action::Launch(sel));
+                }
                 let name = self.providers[self.tab]
                     .accounts()
                     .get(sel)
@@ -397,7 +427,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.session_picker => {
                 let p = &self.providers[self.tab];
                 self.mode = if p.knobs().is_empty() {
                     Mode::Form(Form::login(p.name()))
@@ -405,7 +435,7 @@ impl App {
                     Mode::AddMethod(0)
                 };
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e') if !self.session_picker => {
                 if n == 0 {
                     return Ok(Action::None);
                 }
@@ -424,7 +454,7 @@ impl App {
                     self.mode = Mode::Form(Form::edit(&name, &p.knobs(), values));
                 }
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if !self.session_picker => {
                 if n == 0 {
                     return Ok(Action::None);
                 }
@@ -710,7 +740,11 @@ impl App {
             _ => Line::styled(self.status.clone(), Style::new().cyan()),
         };
         let help = Line::styled(
-            "←/→ provider · ↑/↓ select · enter switch · a add · e edit · d delete · r refresh · q quit",
+            if self.session_picker {
+                "↑/↓ select · enter launch session · r refresh usage · q/esc cancel"
+            } else {
+                "←/→ provider · ↑/↓ select · enter switch · a add · e edit · d delete · r refresh · q quit"
+            },
             Style::new().dim(),
         );
         f.render_widget(
@@ -950,4 +984,62 @@ fn clip(s: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .chain(['…'])
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ReadOnly;
+    impl Provider for ReadOnly {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn accounts(&self) -> Vec<Account> {
+            vec![Account {
+                name: "work".into(),
+                email: None,
+                plan: None,
+            }]
+        }
+        fn active(&self) -> Option<usize> {
+            Some(0)
+        }
+        fn activate(&mut self, _: usize) -> Result<()> {
+            panic!("picker must not activate")
+        }
+        fn delete(&mut self, _: &str) -> Result<()> {
+            panic!("picker must not delete")
+        }
+        fn add(&mut self, _: Option<&str>) -> Result<String> {
+            panic!("picker must not log in")
+        }
+        fn fetches(&self) -> Vec<Fetch> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn session_picker_selects_even_active_profile_and_cancels_without_mutating() {
+        let mut app = App::new(vec![Box::new(ReadOnly)]);
+        app.session_picker = true;
+        for code in [KeyCode::Char('a'), KeyCode::Char('e'), KeyCode::Char('d')] {
+            assert!(matches!(
+                app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap(),
+                Action::None
+            ));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+        assert!(matches!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap(),
+            Action::Launch(0)
+        ));
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap(),
+                Action::Quit
+            ));
+        }
+    }
 }

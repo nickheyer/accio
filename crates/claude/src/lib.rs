@@ -1,6 +1,7 @@
 //! claude provider - swaps claude code's live credentials, usage from the oauth endpoint
 
 mod oauth;
+mod session;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,6 +19,10 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 pub fn provider() -> Result<impl Provider> {
     migrate_flat_profiles();
     Swap::load(Claude::locate()?)
+}
+
+pub fn session_provider() -> Result<impl Provider> {
+    Swap::load_saved(Claude::locate()?)
 }
 
 struct Claude {
@@ -132,46 +137,66 @@ impl Backend for Claude {
     }
 
     fn fetch(&self, files: BTreeMap<String, String>) -> Job {
-        Box::new(move || {
-            let mut creds: Value = match files
-                .get("credentials")
-                .and_then(|s| serde_json::from_str(s).ok())
-            {
-                Some(v) => v,
-                // configured profiles have no oauth, show their facts instead
-                None => return files::facts_job(files)(),
-            };
-            let refreshed = match oauth::ensure_fresh(&mut creds) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Outcome {
-                        usage: Err(format!("{e:#}")),
-                        state: None,
-                    }
-                }
-            };
-            let token = creds
-                .pointer("/claudeAiOauth/accessToken")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let usage = match oauth::fetch_usage(&token) {
-                Ok(v) => {
-                    let u = parse_usage(&v);
-                    if u.windows.is_empty() && u.facts.is_empty() {
-                        Err("no usage data in response".to_string())
-                    } else {
-                        Ok(u)
-                    }
-                }
-                Err(e) => Err(format!("{e:#}")),
-            };
-            Outcome {
-                usage,
-                state: refreshed.then(|| json!({ "credentials": creds.to_string() })),
-            }
-        })
+        fetch(files, true)
     }
+
+    fn fetch_read_only(&self, files: BTreeMap<String, String>) -> Job {
+        fetch(files, false)
+    }
+
+    fn session(
+        &self,
+        files: &BTreeMap<String, String>,
+        dir: &Path,
+    ) -> Result<std::process::Command> {
+        session::prepare(self, files, dir)
+    }
+}
+
+fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
+    Box::new(move || {
+        let mut creds: Value = match files
+            .get("credentials")
+            .and_then(|s| serde_json::from_str(s).ok())
+        {
+            Some(v) => v,
+            // configured profiles have no oauth, show their facts instead
+            None => return files::facts_job(files)(),
+        };
+        let refreshed = match if refresh {
+            oauth::ensure_fresh(&mut creds)
+        } else {
+            Ok(false)
+        } {
+            Ok(r) => r,
+            Err(e) => {
+                return Outcome {
+                    usage: Err(format!("{e:#}")),
+                    state: None,
+                }
+            }
+        };
+        let token = creds
+            .pointer("/claudeAiOauth/accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let usage = match oauth::fetch_usage(&token) {
+            Ok(v) => {
+                let u = parse_usage(&v);
+                if u.windows.is_empty() && u.facts.is_empty() {
+                    Err("no usage data in response".to_string())
+                } else {
+                    Ok(u)
+                }
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+        Outcome {
+            usage,
+            state: refreshed.then(|| json!({ "credentials": creds.to_string() })),
+        }
+    })
 }
 
 // profiles saved before providers had their own directories - copied forward, originals stay put

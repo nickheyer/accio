@@ -3,10 +3,13 @@
 pub mod files;
 mod fsutil;
 mod overlay;
+pub mod session;
 mod swap;
 mod usage;
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Command;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -67,6 +70,11 @@ pub trait Provider {
     fn activate(&mut self, idx: usize) -> Result<()>;
     fn delete(&mut self, name: &str) -> Result<()>;
     fn add(&mut self, name: Option<&str>) -> Result<String>;
+
+    // Build a child command using only a private, caller-owned directory.
+    fn session(&self, _idx: usize, _dir: &Path) -> Result<Command> {
+        bail!("'{}' does not support session launches", self.name())
+    }
 
     // settings a configured profile can set instead of logging in
     fn knobs(&self) -> Vec<Knob> {

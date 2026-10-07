@@ -18,6 +18,12 @@ pub trait Backend {
     fn write_live(&self, contents: &BTreeMap<String, String>) -> Result<()>;
     fn login(&self) -> &[&str];
     fn fetch(&self, files: BTreeMap<String, String>) -> Job;
+    fn fetch_read_only(&self, files: BTreeMap<String, String>) -> Job {
+        crate::files::facts_job(files)
+    }
+    fn session(&self, _files: &BTreeMap<String, String>, _dir: &Path) -> Result<Command> {
+        bail!("'{}' does not support session launches", self.name())
+    }
     fn info(&self) -> Vec<(String, String)> {
         Vec::new()
     }
@@ -38,6 +44,7 @@ pub struct Swap<B: Backend> {
     profiles: Vec<Profile>,
     active: Option<usize>,
     dir: PathBuf,
+    read_only: bool,
 }
 
 struct Profile {
@@ -50,23 +57,46 @@ struct Profile {
 
 impl<B: Backend> Swap<B> {
     pub fn load(backend: B) -> Result<Self> {
+        let dir = Self::profile_dir(&backend)?;
+        Self::load_at(backend, dir)
+    }
+
+    // Launching must not reconcile, migrate, refresh or activate live credentials.
+    pub fn load_saved(backend: B) -> Result<Self> {
+        let dir = Self::profile_dir(&backend)?;
+        Self::read_at(backend, dir, true)
+    }
+
+    fn profile_dir(backend: &B) -> Result<PathBuf> {
         let dir = dirs::config_dir()
             .context("cant determine config dir")?
             .join("accio")
             .join("accounts")
             .join(backend.name());
-        Self::load_at(backend, dir)
+        Ok(dir)
     }
 
     fn load_at(backend: B, dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&dir).with_context(|| format!("cant create {}", dir.display()))?;
+        Self::read_at(backend, dir, false)
+    }
+
+    fn read_at(backend: B, dir: PathBuf, read_only: bool) -> Result<Self> {
+        if !read_only {
+            fs::create_dir_all(&dir).with_context(|| format!("cant create {}", dir.display()))?;
+        }
         let mut store = Swap {
             backend,
             profiles: Vec::new(),
             active: None,
             dir,
+            read_only,
         };
-        for entry in fs::read_dir(&store.dir)? {
+        let entries = match fs::read_dir(&store.dir) {
+            Ok(entries) => entries,
+            Err(e) if read_only && e.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
             let path = entry?.path();
             if path.extension().map_or(true, |e| e != "json") {
                 continue;
@@ -91,8 +121,10 @@ impl<B: Backend> Swap<B> {
             store.profiles.push(Profile::new(pname, contents));
         }
         store.profiles.sort_by(|a, b| a.name.cmp(&b.name));
-        store.sanitize()?;
-        store.absorb_live()?;
+        if !read_only {
+            store.sanitize()?;
+            store.absorb_live()?;
+        }
         Ok(store)
     }
 
@@ -286,6 +318,10 @@ impl<B: Backend> Provider for Swap<B> {
     }
 
     fn activate(&mut self, idx: usize) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only,
+            "session picker cannot switch the live account"
+        );
         let name = self
             .profiles
             .get(idx)
@@ -303,6 +339,7 @@ impl<B: Backend> Provider for Swap<B> {
     }
 
     fn delete(&mut self, name: &str) -> Result<()> {
+        anyhow::ensure!(!self.read_only, "session picker cannot delete accounts");
         let idx = self
             .profiles
             .iter()
@@ -318,6 +355,7 @@ impl<B: Backend> Provider for Swap<B> {
     }
 
     fn add(&mut self, name: Option<&str>) -> Result<String> {
+        anyhow::ensure!(!self.read_only, "session picker cannot add accounts");
         let login: Vec<String> = self.backend.login().iter().map(|s| s.to_string()).collect();
         if login.is_empty() {
             bail!("no login command for '{}'", self.backend.name());
@@ -397,6 +435,7 @@ impl<B: Backend> Provider for Swap<B> {
         name: Option<&str>,
         values: &BTreeMap<String, String>,
     ) -> Result<String> {
+        anyhow::ensure!(!self.read_only, "session picker cannot edit accounts");
         let values: BTreeMap<String, String> = values
             .iter()
             .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
@@ -465,7 +504,16 @@ impl<B: Backend> Provider for Swap<B> {
     }
 
     fn refresh(&mut self) -> Result<()> {
-        self.absorb_live()
+        if self.read_only {
+            Ok(())
+        } else {
+            self.absorb_live()
+        }
+    }
+
+    fn session(&self, idx: usize, dir: &Path) -> Result<Command> {
+        let profile = self.profiles.get(idx).context("no such account")?;
+        self.backend.session(&profile.files, dir)
     }
 
     fn fetches(&self) -> Vec<Fetch> {
@@ -473,12 +521,19 @@ impl<B: Backend> Provider for Swap<B> {
             .iter()
             .map(|p| Fetch {
                 account: p.name.clone(),
-                job: self.backend.fetch(p.files.clone()),
+                job: if self.read_only {
+                    self.backend.fetch_read_only(p.files.clone())
+                } else {
+                    self.backend.fetch(p.files.clone())
+                },
             })
             .collect()
     }
 
     fn absorb_fetch(&mut self, account: &str, state: Value) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let idx = match self.profiles.iter().position(|p| p.name == account) {
             Some(i) => i,
             None => return Ok(()),
@@ -793,6 +848,47 @@ mod tests {
             ("BASE_URL".to_string(), "https://api.z.ai/v1".to_string()),
             ("TOKEN".to_string(), "sk-x".to_string()),
         ])
+    }
+
+    #[test]
+    fn session_store_never_reconciles_or_writes_live_state() {
+        let (live, store) = setup("session-read-only");
+        let creds = r#"{"email":"nick@x.co"}"#;
+        fs::write(live.join("creds.json"), creds).unwrap();
+        let mut original = load(&live, &store);
+        original.configure(Some("glm"), &glm_values()).unwrap();
+        let original_profile = fs::read(store.join("nick.json")).unwrap();
+        // A polluted profile and foreign overlay would both be scrubbed by normal load.
+        let key = original.backend.settings_key();
+        let polluted =
+            json!({"files": {"credentials": creds, key: "{\"env\":{\"TOKEN\":\"wrong\"}}"}})
+                .to_string();
+        fs::write(store.join("nick.json"), &polluted).unwrap();
+        let settings = r#"{"env":{"BASE_URL":"foreign","TOKEN":"foreign"}}"#;
+        fs::write(live.join("settings.json"), settings).unwrap();
+        let marker = fs::read(store.join(".active")).unwrap();
+
+        let mut session =
+            Swap::read_at(FakeBackend { dir: live.clone() }, store.clone(), true).unwrap();
+        session.refresh().unwrap();
+        session
+            .absorb_fetch("nick", json!({"credentials": "new-token"}))
+            .unwrap();
+        assert!(session.activate(0).is_err());
+        assert!(session.configure(Some("glm"), &glm_values()).is_err());
+        assert!(session.add(None).is_err());
+        assert!(session.delete("glm").is_err());
+        assert_eq!(fs::read_to_string(live.join("creds.json")).unwrap(), creds);
+        assert_eq!(
+            fs::read_to_string(live.join("settings.json")).unwrap(),
+            settings
+        );
+        assert_eq!(
+            fs::read_to_string(store.join("nick.json")).unwrap(),
+            polluted
+        );
+        assert_eq!(fs::read(store.join(".active")).unwrap(), marker);
+        assert_ne!(fs::read(store.join("nick.json")).unwrap(), original_profile);
     }
 
     #[test]

@@ -13,7 +13,9 @@ dependencies = [
  "accio-provider",
  "anyhow",
  "crossterm",
+ "dirs",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]
@@ -34,6 +36,7 @@ version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
+ "serde_json",
 ]
 
 [[package]]
@@ -42,6 +45,7 @@ version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
+ "serde_json",
 ]
 
 [[package]]
@@ -50,6 +54,7 @@ version = "0.0.4"
 dependencies = [
  "accio-provider",
  "anyhow",
+ "serde_json",
 ]
 
 [[package]]
