@@ -53,6 +53,25 @@ impl Spec {
             }
         }
     }
+
+    // Claims held here that the other spec lacks
+    pub fn minus(&self, other: &Spec) -> Spec {
+        let merges = self
+            .merges
+            .iter()
+            .filter_map(|(path, chains)| {
+                let rest: BTreeSet<Vec<String>> = match other.merges.get(path) {
+                    Some(theirs) => chains.difference(theirs).cloned().collect(),
+                    None => chains.clone(),
+                };
+                (!rest.is_empty()).then(|| (path.clone(), rest))
+            })
+            .collect();
+        Spec {
+            paths: self.paths.difference(&other.paths).cloned().collect(),
+            merges,
+        }
+    }
 }
 
 // What of the owned surface is on disk right now
@@ -148,6 +167,16 @@ pub fn canon_str(content: &str) -> String {
         Ok(v) => canon(&v).to_string(),
         Err(_) => content.to_string(),
     }
+}
+
+// Patch laid over base as one canonical merge document
+pub fn merge_str(base: &str, patch: &str) -> String {
+    let mut doc = serde_json::from_str::<Value>(base).unwrap_or_else(|_| Value::Object(Map::new()));
+    match serde_json::from_str::<Value>(patch) {
+        Ok(p) => deep_merge(&mut doc, &p),
+        Err(_) => return patch.to_string(),
+    }
+    canon(&doc).to_string()
 }
 
 fn collect_chains(v: &Value, path: &mut Vec<String>, out: &mut BTreeSet<Vec<String>>) {
@@ -288,6 +317,50 @@ mod tests {
             canon_str(r#"{"b":1,"a":{"d":[2],"c":3}}"#),
             r#"{"a":{"c":3,"d":[2]},"b":1}"#
         );
+    }
+
+    #[test]
+    fn minus_keeps_only_unshared_claims() {
+        let mut mine = Spec::default();
+        mine.add(&BTreeMap::from([
+            (
+                "merge:/s.json".to_string(),
+                r#"{"env":{"A":"","B":""}}"#.to_string(),
+            ),
+            ("/own.env".to_string(), String::new()),
+            ("/shared.env".to_string(), String::new()),
+        ]));
+        let mut theirs = Spec::default();
+        theirs.add(&BTreeMap::from([
+            (
+                "merge:/s.json".to_string(),
+                r#"{"env":{"A":"x"}}"#.to_string(),
+            ),
+            ("/shared.env".to_string(), String::new()),
+        ]));
+        let rest = mine.minus(&theirs);
+        assert_eq!(rest.paths, BTreeSet::from(["/own.env".to_string()]));
+        assert_eq!(
+            rest.merges,
+            BTreeMap::from([(
+                "/s.json".to_string(),
+                BTreeSet::from([vec!["env".to_string(), "B".to_string()]])
+            )])
+        );
+        assert!(mine.minus(&mine).merges.is_empty());
+        assert!(mine.minus(&mine).paths.is_empty());
+    }
+
+    #[test]
+    fn merge_str_lays_patch_over_base() {
+        assert_eq!(
+            merge_str(
+                r#"{"env":{"B":"1","A":"0"}}"#,
+                r#"{"env":{"C":"2"},"x":true}"#
+            ),
+            r#"{"env":{"A":"0","B":"1","C":"2"},"x":true}"#
+        );
+        assert_eq!(merge_str("not json", r#"{"a":1}"#), r#"{"a":1}"#);
     }
 
     #[test]

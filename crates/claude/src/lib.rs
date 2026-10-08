@@ -151,6 +151,33 @@ impl Backend for Claude {
     ) -> Result<std::process::Command> {
         session::prepare(self, files, dir)
     }
+
+    fn is_login(&self, plain: &BTreeMap<String, String>) -> bool {
+        plain
+            .get("credentials")
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|creds| has_login(&creds))
+    }
+
+    fn owned(&self) -> BTreeMap<String, String> {
+        self.compose(
+            &self
+                .knobs()
+                .into_iter()
+                .map(|k| (k.name, String::new()))
+                .collect(),
+        )
+    }
+}
+
+// A claude.ai access or refresh token makes a login, mcp discovery state alone does not
+fn has_login(creds: &Value) -> bool {
+    ["accessToken", "refreshToken"].iter().any(|k| {
+        creds
+            .pointer(&format!("/claudeAiOauth/{k}"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    })
 }
 
 fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
@@ -305,4 +332,56 @@ fn keychain_write(body: &str) -> Result<()> {
         anyhow::bail!("keychain write failed - is the login keychain unlocked?");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude() -> Claude {
+        Claude {
+            creds_path: "/nowhere/.claude/.credentials.json".into(),
+            claude_json_path: "/nowhere/.claude.json".into(),
+            settings_key: "~/.claude/settings.json".into(),
+        }
+    }
+
+    fn plain(creds: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("credentials".to_string(), creds.to_string())])
+    }
+
+    #[test]
+    fn login_needs_a_claude_ai_token() {
+        let c = claude();
+        assert!(!c.is_login(&plain(
+            r#"{"mcpOAuth":{"plugin:x|1":{"accessToken":"","clientId":"c"}}}"#
+        )));
+        assert!(!c.is_login(&plain(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#
+        )));
+        assert!(!c.is_login(&plain("not json")));
+        assert!(!c.is_login(&BTreeMap::from([(
+            "oauth_account".to_string(),
+            "{}".to_string()
+        )])));
+        assert!(c.is_login(&plain(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}"#
+        )));
+        assert!(c.is_login(&plain(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"sk-ant-ort01-x"}}"#
+        )));
+    }
+
+    #[test]
+    fn owned_claims_every_knob_in_the_settings_env() {
+        let c = claude();
+        let owned = c.owned();
+        let doc: Value = serde_json::from_str(&owned["merge:~/.claude/settings.json"]).unwrap();
+        let mut keys: Vec<String> = doc["env"].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        let mut knobs: Vec<String> = c.knobs().into_iter().map(|k| k.name).collect();
+        knobs.sort();
+        assert_eq!(keys, knobs);
+        assert!(doc["env"].as_object().unwrap().values().all(|v| v == ""));
+    }
 }

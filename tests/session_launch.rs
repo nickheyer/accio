@@ -80,6 +80,9 @@ exit "${FAKE_EXIT:-0}"
         )
         .unwrap();
         fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let security = root.join("bin/security");
+        fs::write(&security, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(security, fs::Permissions::from_mode(0o755)).unwrap();
         Self {
             root,
             config,
@@ -92,9 +95,14 @@ exit "${FAKE_EXIT:-0}"
     }
 
     fn command_for(&self, provider: &str) -> Command {
+        let mut command = self.accio();
+        command.arg(provider);
+        command
+    }
+
+    fn accio(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_accio"));
         command
-            .arg(provider)
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", &self.config)
             .env(
@@ -423,4 +431,146 @@ fn old_harness_and_nonterminal_picker_fail_without_launching() {
             .count(),
         0
     );
+}
+
+fn write_json(path: &Path, value: Value) {
+    fs::write(path, value.to_string()).unwrap();
+}
+
+fn run(command: &mut Command) -> String {
+    let out = command.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn active_claude(listing: &str) -> Option<String> {
+    listing
+        .lines()
+        .find(|l| l.starts_with("* claude"))
+        .map(|l| l.split_whitespace().nth(2).unwrap().to_string())
+}
+
+#[test]
+fn live_switch_scrubs_orphaned_env_and_restores_the_configured_profile() {
+    let f = Fixture::new();
+    let senpai_creds = json!({"claudeAiOauth": {
+        "accessToken": "oauth-senpai", "refreshToken": "fake-refresh", "expiresAt": 4102444800000_i64
+    }})
+    .to_string();
+    let dead_creds =
+        json!({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}})
+            .to_string();
+    let leftovers =
+        json!({"mcpOAuth": {"plugin:x|1": {"accessToken": "", "clientId": "c"}}}).to_string();
+    write_json(
+        &f.profiles.join("senpai.json"),
+        json!({"files": {
+            "credentials": senpai_creds,
+            "oauth_account": json!({"emailAddress": "senpai@example.com"}).to_string()
+        }}),
+    );
+    write_json(
+        &f.profiles.join("nick.json"),
+        json!({"files": {
+            "credentials": dead_creds,
+            "oauth_account": json!({"emailAddress": "nick@example.com"}).to_string()
+        }}),
+    );
+    // An older accio absorbed cli leftovers into the configured profile and stripped its env
+    write_json(
+        &f.profiles.join("blackwall.json"),
+        json!({"files": {"credentials": leftovers}}),
+    );
+    fs::write(f.profiles.join(".active"), "senpai").unwrap();
+    let creds = f.root.join(".claude/.credentials.json");
+    let settings = f.root.join(".claude/settings.json");
+    let config = f.root.join(".claude.json");
+    fs::write(&creds, &senpai_creds).unwrap();
+    write_json(
+        &config,
+        json!({"hasCompletedOnboarding": true, "oauthAccount": {"emailAddress": "senpai@example.com"}}),
+    );
+    let self_hosted = json!({
+        "ANTHROPIC_AUTH_TOKEN": "self-hosted-token",
+        "ANTHROPIC_BASE_URL": "http://192.168.1.27:8484",
+        "ANTHROPIC_MODEL": "freddie"
+    });
+    let mut env = self_hosted.clone();
+    env["EDITOR"] = "vim".into();
+    write_json(&settings, json!({"theme": "dark", "env": env}));
+    let nick_before = fs::read(f.profiles.join("nick.json")).unwrap();
+
+    let listing = run(f.accio().arg("list"));
+    assert_eq!(
+        active_claude(&listing).as_deref(),
+        Some("senpai"),
+        "{listing}"
+    );
+    assert!(listing.contains("nick@example.com"), "{listing}");
+    assert_eq!(read_json(&settings)["env"], json!({"EDITOR": "vim"}));
+    assert_eq!(read_json(&settings)["theme"], "dark");
+    let blackwall = read_json(&f.profiles.join("blackwall.json"));
+    assert_eq!(blackwall["files"].as_object().unwrap().len(), 1);
+    let restored: Value = serde_json::from_str(
+        blackwall["files"]["merge:~/.claude/settings.json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored, json!({"env": self_hosted}));
+    assert_eq!(fs::read(f.profiles.join("nick.json")).unwrap(), nick_before);
+    assert_eq!(fs::read_to_string(&creds).unwrap(), senpai_creds);
+    assert_eq!(
+        read_json(&config)["oauthAccount"]["emailAddress"],
+        "senpai@example.com"
+    );
+
+    run(f.accio().arg("blackwall"));
+    assert!(!creds.exists());
+    assert!(read_json(&config).get("oauthAccount").is_none());
+    assert_eq!(read_json(&config)["hasCompletedOnboarding"], true);
+    let mut laid = self_hosted.clone();
+    laid["EDITOR"] = "vim".into();
+    assert_eq!(read_json(&settings)["env"], laid);
+
+    // The cli writes discovery state for plugin mcp servers with nobody logged in
+    fs::write(&creds, &leftovers).unwrap();
+    let listing = run(f.accio().arg("list"));
+    assert_eq!(
+        active_claude(&listing).as_deref(),
+        Some("blackwall"),
+        "{listing}"
+    );
+    assert_eq!(read_json(&f.profiles.join("blackwall.json")), blackwall);
+    assert_eq!(read_json(&settings)["env"], laid);
+
+    run(f.accio().arg("senpai"));
+    assert_eq!(fs::read_to_string(&creds).unwrap(), senpai_creds);
+    assert_eq!(
+        read_json(&config)["oauthAccount"]["emailAddress"],
+        "senpai@example.com"
+    );
+    assert_eq!(read_json(&settings)["env"], json!({"EDITOR": "vim"}));
+    assert_eq!(read_json(&f.profiles.join("blackwall.json")), blackwall);
+    let listing = run(f.accio().arg("list"));
+    assert_eq!(
+        active_claude(&listing).as_deref(),
+        Some("senpai"),
+        "{listing}"
+    );
+
+    // Logging out of the cli must not overwrite the saved login
+    fs::write(&creds, &dead_creds).unwrap();
+    let listing = run(f.accio().arg("list"));
+    assert_eq!(active_claude(&listing), None, "{listing}");
+    assert_eq!(
+        read_json(&f.profiles.join("senpai.json"))["files"]["credentials"],
+        senpai_creds
+    );
+    run(f.accio().arg("senpai"));
+    assert_eq!(fs::read_to_string(&creds).unwrap(), senpai_creds);
 }

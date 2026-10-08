@@ -37,6 +37,16 @@ pub trait Backend {
     fn compose(&self, _values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+
+    // Whether plain entries amount to a usable login rather than leftovers the cli wrote
+    fn is_login(&self, plain: &BTreeMap<String, String>) -> bool {
+        !plain.is_empty()
+    }
+
+    // Overlay entries the backend claims even when no profile holds them
+    fn owned(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 pub struct Swap<B: Backend> {
@@ -128,24 +138,27 @@ impl<B: Backend> Swap<B> {
         Ok(store)
     }
 
-    // Login profiles own no overlays, strip strays older versions absorbed
+    // Junk logins lose their plain entries, login profiles lose stray overlays older versions absorbed
     fn sanitize(&mut self) -> Result<()> {
         for i in 0..self.profiles.len() {
-            let p = &mut self.profiles[i];
-            if !p.files.keys().any(|k| !overlay::is_overlay_key(k))
-                || !p.files.keys().any(|k| overlay::is_overlay_key(k))
-            {
+            let (overlays, plain) = overlay::split(&self.profiles[i].files);
+            if plain.is_empty() {
                 continue;
             }
-            p.files.retain(|k, _| !overlay::is_overlay_key(k));
+            let junk = self.profiles[i].identity.is_empty() && !self.backend.is_login(&plain);
+            if !junk && overlays.is_empty() {
+                continue;
+            }
+            let p = &mut self.profiles[i];
+            p.files.retain(|k, _| overlay::is_overlay_key(k) == junk);
             p.derive();
             save_profile(&self.dir, p)?;
         }
         Ok(())
     }
 
-    // union of every profile's overlay claims, so switches clean up after each other
-    fn spec(&self) -> overlay::Spec {
+    // Union of every profile's overlay claims
+    fn claimed(&self) -> overlay::Spec {
         let mut spec = overlay::Spec::default();
         for p in &self.profiles {
             spec.add(&p.files);
@@ -153,10 +166,87 @@ impl<B: Backend> Swap<B> {
         spec
     }
 
+    // Profile claims plus the backend's own, so switches clean up after each other
+    fn spec(&self) -> overlay::Spec {
+        let mut spec = self.claimed();
+        spec.add(&self.backend.owned());
+        spec
+    }
+
+    // Plain live entries, empty unless they form a login
+    fn live_plain(&self) -> BTreeMap<String, String> {
+        let plain = self.backend.read_live();
+        if self.backend.is_login(&plain) {
+            plain
+        } else {
+            BTreeMap::new()
+        }
+    }
+
     fn read_surface(&self) -> BTreeMap<String, String> {
         let mut live = overlay::read(&self.spec());
-        live.extend(self.backend.read_live());
+        live.extend(self.live_plain());
         live
+    }
+
+    // Live entries under backend owned claims that no profile holds
+    fn orphans(&self) -> BTreeMap<String, String> {
+        let mut owned = overlay::Spec::default();
+        owned.add(&self.backend.owned());
+        overlay::read(&owned.minus(&self.claimed()))
+    }
+
+    // Orphans join the one emptied profile, else the marked configured profile, else a new profile
+    fn reclaim(&mut self) -> Result<()> {
+        let orphans = self.orphans();
+        let empties: Vec<usize> = (0..self.profiles.len())
+            .filter(|&i| self.profiles[i].files.is_empty())
+            .collect();
+        let mut home = None;
+        if !orphans.is_empty() {
+            home = match empties.as_slice() {
+                [one] => Some(*one),
+                _ => self
+                    .marker()
+                    .and_then(|m| self.profiles.iter().position(|p| p.name == m))
+                    .filter(|&i| {
+                        self.profiles[i]
+                            .files
+                            .keys()
+                            .all(|k| overlay::is_overlay_key(k))
+                    }),
+            };
+            if let Some(idx) = home {
+                self.profiles[idx].adopt(&orphans);
+                save_profile(&self.dir, &self.profiles[idx])?;
+            }
+        }
+        for &i in empties.iter().rev() {
+            if home == Some(i) {
+                continue;
+            }
+            let path = self.dir.join(format!("{}.json", self.profiles[i].name));
+            fs::remove_file(&path).with_context(|| format!("cant remove {}", path.display()))?;
+            self.profiles.remove(i);
+        }
+        if orphans.is_empty() || home.is_some() {
+            return Ok(());
+        }
+        let incoming = Profile::new(String::new(), orphans);
+        let base = incoming
+            .email
+            .as_deref()
+            .map(sanitize_name)
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "custom".to_string());
+        let profile = Profile {
+            name: self.unique_name(&base),
+            ..incoming
+        };
+        save_profile(&self.dir, &profile)?;
+        self.profiles.push(profile);
+        self.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(())
     }
 
     fn write_surface(&self, contents: &BTreeMap<String, String>) -> Result<()> {
@@ -182,12 +272,13 @@ impl<B: Backend> Swap<B> {
         let mut spec = overlay::Spec::default();
         spec.add(&self.profiles[idx].files);
         let mut live = overlay::read(&spec);
-        live.extend(self.backend.read_live());
+        live.extend(self.live_plain());
         live
     }
 
     fn absorb_live(&mut self) -> Result<()> {
         self.active = None;
+        self.reclaim()?;
         let live = self.read_surface();
         if live.is_empty() {
             return Ok(());
@@ -239,7 +330,7 @@ impl<B: Backend> Swap<B> {
         }
 
         // A fresh login owns backend files only, claimed overlays belong to others
-        let files = self.backend.read_live();
+        let files = self.live_plain();
         if files.is_empty() {
             return Ok(());
         }
@@ -584,6 +675,18 @@ impl Profile {
         p
     }
 
+    // Entries join the profile, merge documents for the same path deep merge
+    fn adopt(&mut self, entries: &BTreeMap<String, String>) {
+        for (k, v) in entries {
+            let merged = match self.files.get(k).filter(|_| overlay::is_merge_key(k)) {
+                Some(existing) => overlay::merge_str(existing, v),
+                None => v.clone(),
+            };
+            self.files.insert(k.clone(), merged);
+        }
+        self.derive();
+    }
+
     // whatever the files say about who this is - emails and account ids, JWT payloads included
     fn derive(&mut self) {
         let (mut emails, mut ids, mut plan) = (Vec::new(), Vec::new(), None);
@@ -819,6 +922,32 @@ mod tests {
         fn compose(&self, values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
             BTreeMap::from([(self.settings_key(), json!({ "env": values }).to_string())])
         }
+
+        fn is_login(&self, plain: &BTreeMap<String, String>) -> bool {
+            plain
+                .get("credentials")
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .and_then(|v| {
+                    v.get("token")
+                        .and_then(Value::as_str)
+                        .map(|t| !t.is_empty())
+                })
+                .unwrap_or(false)
+        }
+
+        fn owned(&self) -> BTreeMap<String, String> {
+            self.compose(
+                &self
+                    .knobs()
+                    .into_iter()
+                    .map(|k| (k.name, String::new()))
+                    .collect(),
+            )
+        }
+    }
+
+    fn junk() -> &'static str {
+        r#"{"mcp":{"discovery":true}}"#
     }
 
     fn setup(name: &str) -> (PathBuf, PathBuf) {
@@ -853,7 +982,7 @@ mod tests {
     #[test]
     fn session_store_never_reconciles_or_writes_live_state() {
         let (live, store) = setup("session-read-only");
-        let creds = r#"{"email":"nick@x.co"}"#;
+        let creds = r#"{"email":"nick@x.co","token":"t"}"#;
         fs::write(live.join("creds.json"), creds).unwrap();
         let mut original = load(&live, &store);
         original.configure(Some("glm"), &glm_values()).unwrap();
@@ -894,7 +1023,11 @@ mod tests {
     #[test]
     fn switch_cycle_lays_and_lifts_configured_env() {
         let (live, store) = setup("cycle");
-        fs::write(live.join("creds.json"), r#"{"email":"nick@x.co"}"#).unwrap();
+        fs::write(
+            live.join("creds.json"),
+            r#"{"email":"nick@x.co","token":"t"}"#,
+        )
+        .unwrap();
         fs::write(live.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
 
         let mut s = load(&live, &store);
@@ -926,7 +1059,7 @@ mod tests {
     fn polluted_login_profile_is_sanitized_and_surface_scrubbed() {
         let (live, store) = setup("polluted");
         let key = format!("merge:{}", live.join("settings.json").display());
-        let creds = r#"{"email":"nick@x.co"}"#;
+        let creds = r#"{"email":"nick@x.co","token":"t"}"#;
         let env = r#"{"env":{"BASE_URL":"https://api.z.ai/v1","TOKEN":"sk-x"}}"#;
         fs::write(
             store.join("nick.json"),
@@ -971,7 +1104,7 @@ mod tests {
         fs::write(
             store.join("nick.json"),
             serde_json::to_string(
-                &json!({ "files": { "credentials": r#"{"email":"nick@x.co","v":1}"# } }),
+                &json!({ "files": { "credentials": r#"{"email":"nick@x.co","token":"t","v":1}"# } }),
             )
             .unwrap(),
         )
@@ -982,7 +1115,11 @@ mod tests {
         )
         .unwrap();
         // glm was active, then the user logged straight back in with the cli
-        fs::write(live.join("creds.json"), r#"{"email":"nick@x.co","v":2}"#).unwrap();
+        fs::write(
+            live.join("creds.json"),
+            r#"{"email":"nick@x.co","token":"t","v":2}"#,
+        )
+        .unwrap();
         fs::write(
             live.join("settings.json"),
             r#"{"env":{"BASE_URL":"https://api.z.ai/v1","TOKEN":"sk-x"}}"#,
@@ -997,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             nick.files.get("credentials").unwrap(),
-            r#"{"email":"nick@x.co","v":2}"#
+            r#"{"email":"nick@x.co","token":"t","v":2}"#
         );
         assert!(
             !nick.files.contains_key(&key),
@@ -1042,7 +1179,11 @@ mod tests {
     #[test]
     fn reconfigure_updates_in_place_and_retires_dropped_keys() {
         let (live, store) = setup("reconfig");
-        fs::write(live.join("creds.json"), r#"{"email":"nick@x.co"}"#).unwrap();
+        fs::write(
+            live.join("creds.json"),
+            r#"{"email":"nick@x.co","token":"t"}"#,
+        )
+        .unwrap();
         fs::write(live.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
 
         let mut s = load(&live, &store);
@@ -1074,6 +1215,200 @@ mod tests {
             s.values("nick").is_empty(),
             "login accounts are not editable"
         );
+    }
+
+    #[test]
+    fn leftover_credentials_without_a_login_are_ignored() {
+        let (live, store) = setup("leftovers");
+        let key = format!("merge:{}", live.join("settings.json").display());
+        let env = r#"{"env":{"BASE_URL":"https://api.z.ai/v1","TOKEN":"sk-x"}}"#;
+        fs::write(
+            store.join("glm.json"),
+            json!({ "files": { &key: env } }).to_string(),
+        )
+        .unwrap();
+        fs::write(store.join(".active"), "glm").unwrap();
+        fs::write(
+            live.join("settings.json"),
+            r#"{"theme":"dark","env":{"BASE_URL":"https://api.z.ai/v1","TOKEN":"sk-x"}}"#,
+        )
+        .unwrap();
+        // the cli wrote discovery state into the creds file while glm was live
+        fs::write(live.join("creds.json"), junk()).unwrap();
+
+        for _ in 0..2 {
+            let s = load(&live, &store);
+            assert_eq!(s.active, Some(0));
+            assert_eq!(
+                s.profiles[0].files,
+                BTreeMap::from([(key.clone(), overlay::canon_str(env))])
+            );
+        }
+        assert_eq!(fs::read_to_string(live.join("creds.json")).unwrap(), junk());
+    }
+
+    #[test]
+    fn orphaned_owned_env_returns_to_the_emptied_profile_and_leaves_on_switch() {
+        let (live, store) = setup("orphan");
+        let creds = r#"{"email":"nick@x.co","token":"t"}"#;
+        fs::write(
+            store.join("nick.json"),
+            json!({ "files": { "credentials": creds } }).to_string(),
+        )
+        .unwrap();
+        // an older version absorbed cli leftovers into the configured profile and stripped its env
+        fs::write(
+            store.join("blackwall.json"),
+            json!({ "files": { "credentials": junk() } }).to_string(),
+        )
+        .unwrap();
+        fs::write(store.join(".active"), "nick").unwrap();
+        fs::write(live.join("creds.json"), creds).unwrap();
+        fs::write(
+            live.join("settings.json"),
+            r#"{"theme":"dark","env":{"BASE_URL":"http://10.0.0.2:8484","TOKEN":"sk-self"}}"#,
+        )
+        .unwrap();
+
+        let mut s = load(&live, &store);
+        let nick = s.profiles.iter().position(|p| p.name == "nick").unwrap();
+        let blackwall = s
+            .profiles
+            .iter()
+            .position(|p| p.name == "blackwall")
+            .unwrap();
+        assert_eq!(s.active, Some(nick));
+        let self_hosted = BTreeMap::from([
+            ("BASE_URL".to_string(), "http://10.0.0.2:8484".to_string()),
+            ("TOKEN".to_string(), "sk-self".to_string()),
+        ]);
+        assert_eq!(s.values("blackwall"), self_hosted);
+        assert!(
+            settings(&live).get("env").is_none(),
+            "orphaned env must leave while a login profile is live"
+        );
+        assert_eq!(settings(&live).pointer("/theme").unwrap(), "dark");
+        assert_eq!(fs::read_to_string(live.join("creds.json")).unwrap(), creds);
+
+        s.activate(blackwall).unwrap();
+        assert!(!live.join("creds.json").exists());
+        assert_eq!(
+            settings(&live).pointer("/env/BASE_URL").unwrap(),
+            "http://10.0.0.2:8484"
+        );
+        s.activate(nick).unwrap();
+        assert!(settings(&live).get("env").is_none());
+        assert_eq!(fs::read_to_string(live.join("creds.json")).unwrap(), creds);
+        let s = load(&live, &store);
+        assert_eq!(s.values("blackwall"), self_hosted);
+    }
+
+    #[test]
+    fn hand_added_owned_env_joins_the_marked_configured_profile() {
+        let (live, store) = setup("adopt");
+        let key = format!("merge:{}", live.join("settings.json").display());
+        fs::write(
+            store.join("glm.json"),
+            json!({ "files": { &key: r#"{"env":{"BASE_URL":"https://a.example"}}"# } }).to_string(),
+        )
+        .unwrap();
+        fs::write(store.join(".active"), "glm").unwrap();
+        fs::write(
+            live.join("settings.json"),
+            r#"{"env":{"BASE_URL":"https://a.example","TOKEN":"sk-new"}}"#,
+        )
+        .unwrap();
+
+        let s = load(&live, &store);
+        assert_eq!(s.active, Some(0));
+        assert_eq!(
+            s.values("glm"),
+            BTreeMap::from([
+                ("BASE_URL".to_string(), "https://a.example".to_string()),
+                ("TOKEN".to_string(), "sk-new".to_string()),
+            ])
+        );
+        assert_eq!(
+            read_json(&store.join("glm.json"))
+                .unwrap()
+                .pointer("/files")
+                .unwrap()
+                .get(&key)
+                .unwrap(),
+            &overlay::canon_str(r#"{"env":{"BASE_URL":"https://a.example","TOKEN":"sk-new"}}"#)
+        );
+    }
+
+    #[test]
+    fn homeless_orphans_become_a_profile_and_junk_profiles_go() {
+        let (live, store) = setup("homeless");
+        let creds = r#"{"email":"nick@x.co","token":"t"}"#;
+        fs::write(
+            store.join("nick.json"),
+            json!({ "files": { "credentials": creds } }).to_string(),
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            fs::write(
+                store.join(format!("{name}.json")),
+                json!({ "files": { "credentials": junk() } }).to_string(),
+            )
+            .unwrap();
+        }
+        fs::write(store.join(".active"), "nick").unwrap();
+        fs::write(live.join("creds.json"), creds).unwrap();
+        fs::write(
+            live.join("settings.json"),
+            r#"{"env":{"BASE_URL":"https://api.z.ai/v1","TOKEN":"sk-x"}}"#,
+        )
+        .unwrap();
+
+        let s = load(&live, &store);
+        let names: Vec<&str> = s.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["api-z-ai", "nick"]);
+        assert!(!store.join("a.json").exists());
+        assert!(!store.join("b.json").exists());
+        assert_eq!(s.values("api-z-ai"), glm_values());
+        assert_eq!(s.active, Some(1));
+        assert!(settings(&live).get("env").is_none());
+    }
+
+    #[test]
+    fn logged_out_live_state_leaves_saved_profiles_alone() {
+        let (live, store) = setup("logout");
+        let creds = r#"{"email":"nick@x.co","token":"t"}"#;
+        let dead = r#"{"email":"old@x.co","token":""}"#;
+        fs::write(
+            store.join("nick.json"),
+            json!({ "files": { "credentials": creds } }).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            store.join("old.json"),
+            json!({ "files": { "credentials": dead } }).to_string(),
+        )
+        .unwrap();
+        fs::write(store.join(".active"), "nick").unwrap();
+        fs::write(
+            live.join("creds.json"),
+            r#"{"email":"nick@x.co","token":""}"#,
+        )
+        .unwrap();
+
+        let mut s = load(&live, &store);
+        assert_eq!(s.active, None);
+        let names: Vec<&str> = s.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["nick", "old"]);
+        assert_eq!(s.profiles[1].email.as_deref(), Some("old@x.co"));
+        assert_eq!(
+            read_json(&store.join("nick.json"))
+                .unwrap()
+                .pointer("/files/credentials")
+                .unwrap(),
+            creds
+        );
+        s.activate(0).unwrap();
+        assert_eq!(fs::read_to_string(live.join("creds.json")).unwrap(), creds);
     }
 
     #[test]
