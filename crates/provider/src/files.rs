@@ -130,6 +130,7 @@ fn redact(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::MetricValue;
 
     #[test]
     fn facts_hide_secrets() {
@@ -140,11 +141,16 @@ mod tests {
                 .to_string(),
         );
         let u = facts(&files);
-        assert!(u.facts.iter().all(|f| !f.value.contains("sk-verysecret")));
-        assert!(u.facts.iter().all(|f| !f.value.contains("a.b.c")));
+        let texts: Vec<String> = u.metrics.iter().map(|m| m.value.text()).collect();
+        assert!(texts.iter().all(|t| !t.contains("sk-verysecret")));
+        assert!(texts.iter().all(|t| !t.contains("a.b.c")));
         assert!(u
-            .facts
+            .metrics
             .iter()
-            .any(|f| f.label == "auth · plan" && f.value == "plus"));
+            .any(|m| m.id == "auth.plan" && m.value.text() == "plus"));
+        assert!(u
+            .metrics
+            .iter()
+            .any(|m| m.id == "auth.last_refresh" && matches!(m.value, MetricValue::Time(_))));
     }
 }

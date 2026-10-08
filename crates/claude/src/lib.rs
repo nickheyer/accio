@@ -211,7 +211,7 @@ fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
         let usage = match oauth::fetch_usage(&token) {
             Ok(v) => {
                 let u = parse_usage(&v);
-                if u.windows.is_empty() && u.facts.is_empty() {
+                if u.metrics.is_empty() {
                     Err("no usage data in response".to_string())
                 } else {
                     Ok(u)

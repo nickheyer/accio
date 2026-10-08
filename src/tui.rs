@@ -1,13 +1,22 @@
+use std::cell::Cell;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use accio_provider::{
-    humanize_until, Account, Fetch, Knob, Outcome, Provider, Severity, Usage, Window,
+    common_prefix, humanize_until, label, read_json, write_atomic, Account, Fetch, Knob, Metric,
+    MetricValue, Outcome, Provider, Scale, Usage,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*, DefaultTerminal};
+use serde_json::{json, Map, Value};
+
+const BAR: Color = Color::Cyan;
+const SCROLL_STEP: usize = 5;
 
 enum UsageState {
     Loading,
@@ -26,12 +35,94 @@ enum Mode {
     AddMethod(usize),
     Form(Form),
     ConfirmDelete(String),
+    SortPicker(usize),
 }
 
 const ADD_METHODS: [&str; 2] = [
     "log in with the provider cli",
     "configure an endpoint or key",
 ];
+
+// Which metric orders a provider's accounts, unset means the first bounded number seen
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SortPref {
+    metric: Option<Vec<String>>,
+    descending: bool,
+}
+
+impl SortPref {
+    fn arrow(&self) -> &'static str {
+        if self.descending {
+            "↓"
+        } else {
+            "↑"
+        }
+    }
+}
+
+#[derive(Default)]
+struct Prefs {
+    sort: BTreeMap<String, SortPref>,
+}
+
+impl Prefs {
+    fn load(path: &Path) -> Self {
+        let mut prefs = Prefs::default();
+        let Some(v) = read_json(path) else {
+            return prefs;
+        };
+        if let Some(sort) = v.get("sort").and_then(Value::as_object) {
+            for (provider, s) in sort {
+                let metric = s.get("metric").and_then(Value::as_array).map(|segments| {
+                    segments
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                });
+                prefs.sort.insert(
+                    provider.clone(),
+                    SortPref {
+                        metric: metric.filter(|m| !m.is_empty()),
+                        descending: s
+                            .get("descending")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                );
+            }
+        }
+        prefs
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        let sort: Map<String, Value> = self
+            .sort
+            .iter()
+            .map(|(p, s)| {
+                (
+                    p.clone(),
+                    json!({ "metric": s.metric, "descending": s.descending }),
+                )
+            })
+            .collect();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cant create {}", parent.display()))?;
+        }
+        write_atomic(
+            path,
+            serde_json::to_string_pretty(&json!({ "sort": sort }))?.as_bytes(),
+        )
+    }
+}
+
+fn prefs_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("cant determine config dir")?
+        .join("accio")
+        .join("tui.json"))
+}
 
 // All fields visible at once, hints live inside the inputs
 struct Form {
@@ -95,7 +186,7 @@ impl Form {
     fn configure(provider: &str, knobs: &[Knob]) -> Self {
         let mut fields = vec![Field {
             label: "name".to_string(),
-            hint: "defaults to the endpoint host".to_string(),
+            hint: "profile name".to_string(),
             value: String::new(),
             secret: false,
             extra: false,
@@ -157,7 +248,9 @@ enum Action {
 pub fn run() -> Result<()> {
     let providers = crate::providers()?;
     let mut terminal = ratatui::init();
-    let result = App::new(providers).run(&mut terminal).map(|_| ());
+    let result = App::new(providers, prefs_path()?)
+        .run(&mut terminal)
+        .map(|_| ());
     ratatui::restore();
     result
 }
@@ -176,7 +269,7 @@ pub fn pick_session(provider: Box<dyn Provider>) -> Result<Option<(Box<dyn Provi
         "the profile picker needs a terminal - use `accio {} --profile NAME` instead",
         provider.name()
     );
-    let mut app = App::new(vec![provider]);
+    let mut app = App::new(vec![provider], prefs_path()?);
     app.session_picker = true;
     app.status = "Choose a profile for this session".into();
     let mut terminal = ratatui::init();
@@ -195,10 +288,13 @@ struct App {
     tx: Sender<FetchMsg>,
     rx: Receiver<FetchMsg>,
     session_picker: bool,
+    prefs: Prefs,
+    prefs_path: PathBuf,
+    usage_scroll: Cell<usize>,
 }
 
 impl App {
-    fn new(providers: Vec<Box<dyn Provider>>) -> Self {
+    fn new(providers: Vec<Box<dyn Provider>>, prefs_path: PathBuf) -> Self {
         let (tx, rx) = channel();
         let selected: Vec<usize> = providers.iter().map(|p| p.active().unwrap_or(0)).collect();
         App {
@@ -211,6 +307,9 @@ impl App {
             tx,
             rx,
             session_picker: false,
+            prefs: Prefs::load(&prefs_path),
+            prefs_path,
+            usage_scroll: Cell::new(0),
         }
     }
 
@@ -251,8 +350,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if let Mode::SortPicker(cursor) = self.mode {
+            self.on_key_picker(cursor, key);
+            return Ok(Action::None);
+        }
         match &mut self.mode {
             Mode::Normal => return self.on_key_normal(key),
+            Mode::SortPicker(_) => {}
             Mode::AddMethod(selected) => match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Up
@@ -325,6 +429,33 @@ impl App {
         Ok(Action::None)
     }
 
+    // Enter on the metric already in charge flips the direction instead
+    fn on_key_picker(&mut self, cursor: usize, key: KeyEvent) {
+        let count = self.metric_union(self.tab).len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::SortPicker(cursor.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::SortPicker((cursor + 1).min(count.saturating_sub(1)));
+            }
+            KeyCode::Enter => {
+                let picked = self
+                    .metric_union(self.tab)
+                    .get(cursor)
+                    .map(|m| (m.id.clone(), m.path.clone()));
+                self.mode = Mode::Normal;
+                if let Some((id, path)) = picked {
+                    let pref = self.sort_pref(self.tab);
+                    let flip = self.sort_id(self.tab).as_deref() == Some(id.as_str());
+                    self.set_sort(path, pref.descending != flip);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn submit_form(&mut self) -> Result<Action> {
         let form = match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Form(f) => f,
@@ -387,20 +518,18 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.tab = (self.tab + 1) % self.providers.len();
+                self.usage_scroll.set(0);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = (self.tab + self.providers.len() - 1) % self.providers.len();
+                self.usage_scroll.set(0);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if n > 0 {
-                    self.selected[self.tab] = (self.selected[self.tab] + 1) % n;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if n > 0 {
-                    self.selected[self.tab] = (self.selected[self.tab] + n - 1) % n;
-                }
-            }
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::PageDown => self.usage_scroll.set(self.usage_scroll.get() + SCROLL_STEP),
+            KeyCode::PageUp => self
+                .usage_scroll
+                .set(self.usage_scroll.get().saturating_sub(SCROLL_STEP)),
             KeyCode::Enter => {
                 if n == 0 {
                     return Ok(Action::None);
@@ -427,6 +556,26 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('s') => {
+                let union = self.metric_union(self.tab);
+                if union.is_empty() {
+                    self.status = "no metrics to sort by yet".into();
+                } else {
+                    let current = self.sort_id(self.tab);
+                    let cursor = union
+                        .iter()
+                        .position(|m| Some(m.id.as_str()) == current.as_deref())
+                        .unwrap_or(0);
+                    self.mode = Mode::SortPicker(cursor);
+                }
+            }
+            KeyCode::Char('S') => match self.sort_path(self.tab) {
+                Some(path) => {
+                    let descending = self.sort_pref(self.tab).descending;
+                    self.set_sort(path, !descending);
+                }
+                None => self.status = "no metrics to sort by yet".into(),
+            },
             KeyCode::Char('a') if !self.session_picker => {
                 let p = &self.providers[self.tab];
                 self.mode = if p.knobs().is_empty() {
@@ -478,6 +627,135 @@ impl App {
             _ => {}
         }
         Ok(Action::None)
+    }
+
+    // Moves the selection through the sorted list, wrapping at both ends
+    fn step(&mut self, delta: isize) {
+        let order = self.order(self.tab);
+        if order.is_empty() {
+            return;
+        }
+        let pos = order
+            .iter()
+            .position(|&i| i == self.selected[self.tab])
+            .unwrap_or(0) as isize;
+        let n = order.len() as isize;
+        self.selected[self.tab] = order[((pos + delta).rem_euclid(n)) as usize];
+        self.usage_scroll.set(0);
+    }
+
+    fn set_sort(&mut self, path: Vec<String>, descending: bool) {
+        let provider = self.providers[self.tab].name().to_string();
+        let pref = SortPref {
+            metric: Some(path),
+            descending,
+        };
+        self.status = format!(
+            "{} accounts ordered by {} {}",
+            provider,
+            label(
+                pref.metric.as_deref().unwrap_or_default(),
+                self.label_skip(self.tab)
+            ),
+            pref.arrow()
+        );
+        self.prefs.sort.insert(provider, pref);
+        if let Err(e) = self.prefs.save(&self.prefs_path) {
+            self.status = format!("could not save sort preference: {e:#}");
+        }
+    }
+
+    fn sort_pref(&self, tab: usize) -> SortPref {
+        self.prefs
+            .sort
+            .get(self.providers[tab].name())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    // Chosen metric path, or the first bounded number any account reported
+    fn sort_path(&self, tab: usize) -> Option<Vec<String>> {
+        if let Some(path) = self.sort_pref(tab).metric {
+            return Some(path);
+        }
+        let union = self.metric_union(tab);
+        union
+            .iter()
+            .find(|m| {
+                matches!(&m.value, MetricValue::Number { scale, .. } if *scale != Scale::Relative)
+            })
+            .or_else(|| union.iter().find(|m| m.value.is_number()))
+            .map(|m| m.path.clone())
+    }
+
+    fn sort_id(&self, tab: usize) -> Option<String> {
+        self.sort_path(tab).map(|p| p.join("."))
+    }
+
+    // Leading path segments shared by every metric on the tab, dropped from labels
+    fn label_skip(&self, tab: usize) -> usize {
+        common_prefix(self.metric_union(tab).iter().map(|m| m.path.as_slice()))
+    }
+
+    // Every metric any account on the tab reported, in the order first seen
+    fn metric_union(&self, tab: usize) -> Vec<&Metric> {
+        let mut seen: Vec<&Metric> = Vec::new();
+        for account in self.providers[tab].accounts() {
+            if let Some(UsageState::Ready(u)) = self.usage.get(&(tab, account.name)) {
+                for m in &u.metrics {
+                    if !seen.iter().any(|s| s.id == m.id) {
+                        seen.push(m);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    fn metric_of(&self, tab: usize, account: &str, id: &str) -> Option<&Metric> {
+        match self.usage.get(&(tab, account.to_string()))? {
+            UsageState::Ready(u) => u.metrics.iter().find(|m| m.id == id),
+            _ => None,
+        }
+    }
+
+    // Largest value of one metric across the tab, what relative bars fill against
+    fn relative_max(&self, tab: usize, id: &str) -> f64 {
+        self.providers[tab]
+            .accounts()
+            .iter()
+            .filter_map(|a| self.metric_of(tab, &a.name, id))
+            .filter_map(|m| match m.value {
+                MetricValue::Number { value, .. } => Some(value),
+                _ => None,
+            })
+            .fold(0.0, f64::max)
+    }
+
+    // Account indexes in display order, accounts without the metric sink to the bottom
+    fn order(&self, tab: usize) -> Vec<usize> {
+        let accounts = self.providers[tab].accounts();
+        let mut idx: Vec<usize> = (0..accounts.len()).collect();
+        let Some(id) = self.sort_id(tab) else {
+            return idx;
+        };
+        let descending = self.sort_pref(tab).descending;
+        idx.sort_by(|&a, &b| {
+            let va = self
+                .metric_of(tab, &accounts[a].name, &id)
+                .map(|m| &m.value);
+            let vb = self
+                .metric_of(tab, &accounts[b].name, &id)
+                .map(|m| &m.value);
+            match (va, vb) {
+                (Some(x), Some(y)) if descending => y.compare(x),
+                (Some(x), Some(y)) => x.compare(y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        });
+        idx
     }
 
     fn clamp_selection(&mut self) {
@@ -550,6 +828,7 @@ impl App {
         match &self.mode {
             Mode::AddMethod(selected) => self.render_menu(f, *selected),
             Mode::Form(form) => render_form(f, form),
+            Mode::SortPicker(cursor) => self.render_sort_picker(f, *cursor),
             _ => {}
         }
     }
@@ -587,6 +866,79 @@ impl App {
         );
     }
 
+    // Each metric the tab knows with the selected account's reading beside it
+    fn render_sort_picker(&self, f: &mut Frame, cursor: usize) {
+        let tab = self.tab;
+        let p = &self.providers[tab];
+        let union = self.metric_union(tab);
+        let skip = self.label_skip(tab);
+        let current = self.sort_id(tab);
+        let pref = self.sort_pref(tab);
+        let account = p
+            .accounts()
+            .get(self.selected[tab])
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        let labels: Vec<String> = union.iter().map(|m| label(&m.path, skip)).collect();
+        let label_w = labels
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(6)
+            .clamp(6, (f.area().width as usize / 2).max(6));
+        let value_w = 22;
+        let items: Vec<ListItem> = union
+            .iter()
+            .zip(&labels)
+            .map(|(m, l)| {
+                let marker = if current.as_deref() == Some(m.id.as_str()) {
+                    format!("{} ", pref.arrow())
+                } else {
+                    "  ".to_string()
+                };
+                let value = self
+                    .metric_of(tab, &account, &m.id)
+                    .map(|m| m.value.brief())
+                    .unwrap_or_else(|| "—".to_string());
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, Style::new().fg(BAR).bold()),
+                    Span::raw(pad_label(l, label_w)),
+                    Span::raw("  "),
+                    Span::styled(clip(&value, value_w), Style::new().dim()),
+                ]))
+            })
+            .collect();
+        let rect = centered(
+            f.area(),
+            (label_w + value_w + 12) as u16,
+            items.len() as u16 + 5,
+        );
+        f.render_widget(Clear, rect);
+        let block = panel(format!(" sort {} accounts by ", p.name()));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let [list_area, hint_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+        let mut state = ListState::default().with_selected(Some(cursor));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▶ ")
+                .highlight_style(Style::new().bold()),
+            list_area,
+            &mut state,
+        );
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::styled(
+                    "enter choose · enter on the current one flips order · esc cancel",
+                    Style::new().dim(),
+                ),
+            ]),
+            hint_area,
+        );
+    }
+
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
         let mut spans = vec![Span::styled(" accio ", Style::new().bold()), Span::raw(" ")];
         for (i, p) in self.providers.iter().enumerate() {
@@ -604,7 +956,8 @@ impl App {
 
     fn render_accounts(&self, f: &mut Frame, area: Rect) {
         let width = area.width.saturating_sub(6) as usize; // borders, padding, selection arrow
-        let p = &self.providers[self.tab];
+        let tab = self.tab;
+        let p = &self.providers[tab];
         let rows = p.accounts();
         let name_w = column(&rows, |r| r.name.chars().count(), 4, 18);
         let mail_w = column(
@@ -619,6 +972,12 @@ impl App {
             3,
             12,
         );
+        let order = self.order(tab);
+        let sort = self.sort_path(tab);
+        let sort_id = sort.as_ref().map(|path| path.join("."));
+        let relative_max = sort_id
+            .as_deref()
+            .map_or(0.0, |id| self.relative_max(tab, id));
 
         let items: Vec<ListItem> = if rows.is_empty() {
             vec![ListItem::new(Line::styled(
@@ -626,9 +985,10 @@ impl App {
                 Style::new().dim(),
             ))]
         } else {
-            rows.iter()
-                .enumerate()
-                .map(|(i, r)| {
+            order
+                .iter()
+                .map(|&i| {
+                    let r = &rows[i];
                     let active = p.active() == Some(i);
                     let left = vec![
                         Span::styled(
@@ -656,15 +1016,30 @@ impl App {
                             Span::raw("")
                         },
                     ];
-                    ListItem::new(Line::from(justify(left, self.summary(&r.name), width)))
+                    let right = self.summary(&r.name, sort_id.as_deref(), relative_max);
+                    ListItem::new(Line::from(justify(left, right, width)))
                 })
                 .collect()
         };
 
-        let mut list_state = ListState::default().with_selected(Some(self.selected[self.tab]));
+        let title = match &sort {
+            Some(path) => format!(
+                " {} accounts ({}) · {} {} ",
+                p.name(),
+                rows.len(),
+                self.sort_pref(tab).arrow(),
+                label(path, self.label_skip(tab))
+            ),
+            None => format!(" {} accounts ({}) ", p.name(), rows.len()),
+        };
+        let highlighted = order
+            .iter()
+            .position(|&i| i == self.selected[tab])
+            .unwrap_or(0);
+        let mut list_state = ListState::default().with_selected(Some(highlighted));
         f.render_stateful_widget(
             List::new(items)
-                .block(panel(format!(" {} accounts ({}) ", p.name(), rows.len())))
+                .block(panel(title))
                 .highlight_symbol("▶ ")
                 .highlight_style(Style::new().bold()),
             area,
@@ -672,29 +1047,30 @@ impl App {
         );
     }
 
-    // The worst window an account is sitting at
-    fn summary(&self, name: &str) -> Vec<Span<'static>> {
+    // The sort metric's reading for one account row
+    fn summary(&self, name: &str, sort_id: Option<&str>, relative_max: f64) -> Vec<Span<'static>> {
         match self.usage_state(name) {
             None | Some(UsageState::Loading) => {
                 vec![Span::styled("fetching…", Style::new().dim())]
             }
             Some(UsageState::Error(_)) => vec![Span::styled("unavailable", Style::new().red())],
-            Some(UsageState::Ready(u)) => {
-                let peak = u
-                    .windows
-                    .iter()
-                    .max_by(|a, b| a.percent.total_cmp(&b.percent));
-                match peak {
-                    None => Vec::new(),
-                    Some(w) => {
-                        let color = severity_color(&w.severity);
-                        let mut spans = meter(w.percent, 12, color);
+            Some(UsageState::Ready(_)) => {
+                let Some(id) = sort_id else {
+                    return Vec::new();
+                };
+                let Some(m) = self.metric_of(self.tab, name, id) else {
+                    return vec![Span::styled("—", Style::new().dim())];
+                };
+                match m.value.fill(relative_max) {
+                    Some(fill) => {
+                        let mut spans = meter(fill, 12, bar_style(&m.value));
                         spans.push(Span::styled(
-                            format!(" {:>5}", percent(w.percent)),
-                            Style::new().fg(color),
+                            format!(" {:>6}", m.value.text()),
+                            Style::new().bold(),
                         ));
                         spans
                     }
+                    None => vec![Span::styled(clip(&m.value.brief(), 24), Style::new().dim())],
                 }
             }
         }
@@ -704,7 +1080,7 @@ impl App {
         let width = area.width.saturating_sub(4) as usize; // borders + padding
         let p = &self.providers[self.tab];
         let rows = p.accounts();
-        let (title, lines) = if rows.is_empty() {
+        let (mut title, lines) = if rows.is_empty() {
             (" usage ".to_string(), info_lines(p.as_ref()))
         } else {
             let name = rows
@@ -721,14 +1097,115 @@ impl App {
                         Style::new().red(),
                     )]
                 }
-                Some(UsageState::Ready(u)) if u.windows.is_empty() && u.facts.is_empty() => {
+                Some(UsageState::Ready(u)) if u.metrics.is_empty() => {
                     vec![Line::styled("nothing to show", Style::new().dim())]
                 }
-                Some(UsageState::Ready(u)) => usage_lines(u, width),
+                Some(UsageState::Ready(u)) => self.usage_lines(u, width),
             };
             (format!(" usage - {name} "), lines)
         };
-        f.render_widget(Paragraph::new(lines).block(panel(title)), area);
+        let visible = area.height.saturating_sub(2) as usize;
+        let scroll = self
+            .usage_scroll
+            .get()
+            .min(lines.len().saturating_sub(visible));
+        self.usage_scroll.set(scroll);
+        if lines.len() > visible {
+            title = format!(
+                "{title}· {}-{} of {} · pgup/pgdn ",
+                scroll + 1,
+                (scroll + visible).min(lines.len()),
+                lines.len()
+            );
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(panel(title))
+                .scroll((scroll as u16, 0)),
+            area,
+        );
+    }
+
+    // Numbers as bars first, everything else as details below them
+    fn usage_lines(&self, u: &Usage, width: usize) -> Vec<Line<'static>> {
+        let tab = self.tab;
+        let skip = self.label_skip(tab);
+        let sort_id = self.sort_id(tab);
+        let arrow = self.sort_pref(tab).arrow();
+        let rows: Vec<(String, &Metric)> = u
+            .metrics
+            .iter()
+            .map(|m| (label(&m.path, skip), m))
+            .collect();
+        let (bars, details): (Vec<_>, Vec<_>) = rows.iter().partition(|(_, m)| m.value.is_number());
+        let label_w = rows
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(6)
+            .clamp(6, (width / 2).max(6));
+        let value_w = bars
+            .iter()
+            .map(|(_, m)| m.value.text().chars().count())
+            .max()
+            .unwrap_or(3)
+            .clamp(3, 16);
+        let note_w = if bars.iter().any(|(_, m)| m.until.is_some()) {
+            20
+        } else {
+            0
+        };
+        let bar_w = width
+            .saturating_sub(2 + label_w + 2 + 2 + value_w + note_w)
+            .clamp(8, 48);
+
+        let marker = |m: &Metric| {
+            if sort_id.as_deref() == Some(m.id.as_str()) {
+                Span::styled(format!("{arrow} "), Style::new().fg(BAR).bold())
+            } else {
+                Span::raw("  ")
+            }
+        };
+        let mut lines = vec![Line::raw("")];
+        for (l, m) in &bars {
+            let fill = m.value.fill(self.relative_max(tab, &m.id)).unwrap_or(0.0);
+            let mut spans = vec![marker(m), Span::raw(pad_label(l, label_w)), Span::raw("  ")];
+            spans.extend(meter(fill, bar_w, bar_style(&m.value)));
+            spans.push(Span::styled(
+                format!("  {:>value_w$}", m.value.text()),
+                Style::new().bold(),
+            ));
+            if let Some(until) = &m.until {
+                let note = format!("  {} {}", until_verb(&until.key), humanize_until(until.at));
+                let used = 2 + label_w + 2 + bar_w + 2 + value_w;
+                if used + note.chars().count() <= width {
+                    spans.push(Span::styled(note, Style::new().dim()));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        if !details.is_empty() {
+            if !bars.is_empty() {
+                let head = "── details ";
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!(
+                        "{head}{}",
+                        "─".repeat(width.saturating_sub(head.chars().count()))
+                    ),
+                    Style::new().dark_gray(),
+                ));
+            }
+            for (l, m) in &details {
+                lines.push(Line::from(vec![
+                    marker(m),
+                    Span::styled(pad_label(l, label_w), Style::new().dim()),
+                    Span::raw("  "),
+                    Span::raw(clip(&m.value.text(), width.saturating_sub(2 + label_w + 2))),
+                ]));
+            }
+        }
+        lines
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -741,9 +1218,9 @@ impl App {
         };
         let help = Line::styled(
             if self.session_picker {
-                "↑/↓ select · enter launch session · r refresh usage · q/esc cancel"
+                "↑/↓ select · enter launch session · s/S sort · r refresh · q/esc cancel"
             } else {
-                "←/→ provider · ↑/↓ select · enter switch · a add · e edit · d delete · r refresh · q quit"
+                "←/→ provider · ↑/↓ select · enter switch · s/S sort · a add · e edit · d delete · r refresh · q quit"
             },
             Style::new().dim(),
         );
@@ -870,93 +1347,38 @@ fn column(rows: &[Account], f: impl Fn(&Account) -> usize, min: usize, max: usiz
     rows.iter().map(f).max().unwrap_or(min).clamp(min, max)
 }
 
-fn usage_lines(u: &Usage, width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::raw("")];
-    let label_w = u
-        .windows
-        .iter()
-        .map(|w| w.label.chars().count())
-        .max()
-        .unwrap_or(0)
-        .clamp(6, 28);
-    // bar takes whats left
-    let bar_w = width.saturating_sub(label_w + 2 + 6 + 2 + 17).clamp(10, 56);
-    lines.extend(u.windows.iter().map(|w| usage_line(w, label_w, bar_w)));
-
-    if !u.facts.is_empty() {
-        let head = "── details ";
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!(
-                "{head}{}",
-                "─".repeat(width.saturating_sub(head.chars().count()))
-            ),
-            Style::new().dark_gray(),
-        ));
-        let fact_w = u
-            .facts
-            .iter()
-            .map(|f| f.label.chars().count())
-            .max()
-            .unwrap_or(0)
-            .clamp(4, 34);
-        lines.extend(u.facts.iter().map(|f| {
-            Line::from(vec![
-                Span::styled(pad(&f.label, fact_w), Style::new().dim()),
-                Span::raw("  "),
-                Span::raw(clip(&f.value, width.saturating_sub(fact_w + 2))),
-            ])
-        }));
+fn until_verb(key: &str) -> &'static str {
+    if key.to_ascii_lowercase().contains("expir") {
+        "expires in"
+    } else {
+        "resets in"
     }
-    lines
 }
 
-fn usage_line(w: &Window, label_w: usize, bar_w: usize) -> Line<'static> {
-    let color = severity_color(&w.severity);
-    let mut spans = vec![Span::raw(pad(&w.label, label_w)), Span::raw("  ")];
-    spans.extend(meter(w.percent, bar_w, color));
-    spans.push(Span::styled(
-        format!("  {:>6}", percent(w.percent)),
-        Style::new().fg(color).bold(),
-    ));
-    if let Some(t) = w.resets_at {
-        spans.push(Span::styled(
-            format!("  resets in {}", humanize_until(t)),
-            Style::new().dim(),
-        ));
+// Relative bars read dimmer so a full bar is not mistaken for a hit limit
+fn bar_style(v: &MetricValue) -> Style {
+    match v {
+        MetricValue::Number {
+            scale: Scale::Relative,
+            ..
+        } => Style::new().fg(BAR).dim(),
+        _ => Style::new().fg(BAR),
     }
-    Line::from(spans)
 }
 
 // Bar filled to 8ths of cell
-fn meter(pct: f64, width: usize, color: Color) -> Vec<Span<'static>> {
+fn meter(fill: f64, width: usize, style: Style) -> Vec<Span<'static>> {
     const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-    let eighths = (pct.clamp(0.0, 100.0) / 100.0 * (width * 8) as f64).round() as usize;
+    let eighths = (fill.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
     let mut bar = "█".repeat(eighths / 8);
     if eighths / 8 < width && eighths % 8 > 0 {
         bar.push(PARTIAL[eighths % 8]);
     }
     let filled = bar.chars().count();
     vec![
-        Span::styled(bar, Style::new().fg(color)),
+        Span::styled(bar, style),
         Span::styled("█".repeat(width - filled), Style::new().dark_gray()),
     ]
-}
-
-fn severity_color(s: &Severity) -> Color {
-    match s {
-        Severity::Normal => Color::Green,
-        Severity::Warning => Color::Yellow,
-        Severity::Exceeded => Color::Red,
-    }
-}
-
-fn percent(p: f64) -> String {
-    if (p - p.round()).abs() < 0.05 {
-        format!("{p:.0}%")
-    } else {
-        format!("{p:.1}%")
-    }
 }
 
 // Push the spans against the far edge
@@ -976,6 +1398,23 @@ fn pad(s: &str, width: usize) -> String {
     format!("{s:<width$}")
 }
 
+// Metric labels lose their middle so both the group and the leaf stay readable
+fn pad_label(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n <= width {
+        return format!("{s:<width$}");
+    }
+    let head = width.saturating_sub(1) / 2;
+    let tail = width.saturating_sub(1) - head;
+    let clipped: String = s
+        .chars()
+        .take(head)
+        .chain(['…'])
+        .chain(s.chars().skip(n - tail))
+        .collect();
+    format!("{clipped:<width$}")
+}
+
 fn clip(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
@@ -989,18 +1428,22 @@ fn clip(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accio_provider::parse_usage;
 
-    struct ReadOnly;
-    impl Provider for ReadOnly {
+    struct Fake(Vec<&'static str>);
+    impl Provider for Fake {
         fn name(&self) -> &str {
             "fake"
         }
         fn accounts(&self) -> Vec<Account> {
-            vec![Account {
-                name: "work".into(),
-                email: None,
-                plan: None,
-            }]
+            self.0
+                .iter()
+                .map(|n| Account {
+                    name: n.to_string(),
+                    email: None,
+                    plan: None,
+                })
+                .collect()
         }
         fn active(&self) -> Option<usize> {
             Some(0)
@@ -1019,27 +1462,205 @@ mod tests {
         }
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("accio-tui-{}-{name}.json", std::process::id()))
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
+    }
+
     #[test]
     fn session_picker_selects_even_active_profile_and_cancels_without_mutating() {
-        let mut app = App::new(vec![Box::new(ReadOnly)]);
+        let mut app = App::new(vec![Box::new(Fake(vec!["work"]))], scratch("picker"));
         app.session_picker = true;
         for code in [KeyCode::Char('a'), KeyCode::Char('e'), KeyCode::Char('d')] {
-            assert!(matches!(
-                app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap(),
-                Action::None
-            ));
+            assert!(matches!(press(&mut app, code), Action::None));
             assert!(matches!(app.mode, Mode::Normal));
         }
-        assert!(matches!(
-            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                .unwrap(),
-            Action::Launch(0)
-        ));
+        assert!(matches!(press(&mut app, KeyCode::Enter), Action::Launch(0)));
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
-            assert!(matches!(
-                app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap(),
-                Action::Quit
-            ));
+            assert!(matches!(press(&mut app, code), Action::Quit));
         }
+    }
+
+    #[test]
+    fn accounts_order_by_the_chosen_metric_and_the_choice_persists() {
+        let path = scratch("sort");
+        let _ = fs::remove_file(&path);
+        let mut app = App::new(vec![Box::new(Fake(vec!["a", "b", "c", "d"]))], path.clone());
+        let ready = |v: Value| UsageState::Ready(parse_usage(&v));
+        app.usage.insert(
+            (0, "a".into()),
+            ready(serde_json::json!({"five_hour": {"utilization": 60}, "rows": 10})),
+        );
+        app.usage.insert(
+            (0, "b".into()),
+            ready(serde_json::json!({"five_hour": {"utilization": 20}, "rows": 30})),
+        );
+        app.usage
+            .insert((0, "c".into()), ready(serde_json::json!({"rows": 20})));
+        app.usage
+            .insert((0, "d".into()), UsageState::Error("down".into()));
+        assert_eq!(app.sort_id(0).as_deref(), Some("five_hour.utilization"));
+        assert_eq!(app.order(0), vec![1, 0, 2, 3]);
+        assert_eq!(app.step(1), ());
+        assert_eq!(app.selected[0], 2);
+        app.step(-2);
+        assert_eq!(app.selected[0], 1);
+
+        press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(app.mode, Mode::SortPicker(0)));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sort_id(0).as_deref(), Some("rows"));
+        assert_eq!(app.order(0), vec![0, 2, 1, 3]);
+        assert_eq!(app.relative_max(0, "rows"), 30.0);
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(app.order(0), vec![1, 2, 0, 3]);
+        assert!(app.status.contains("rows ↓"));
+        let mut empty = App::new(vec![Box::new(Fake(vec!["lonely"]))], scratch("empty"));
+        press(&mut empty, KeyCode::Char('S'));
+        assert_eq!(empty.status, "no metrics to sort by yet");
+        assert!(empty.prefs.sort.is_empty());
+
+        let reloaded = Prefs::load(&path);
+        assert_eq!(
+            reloaded.sort["fake"],
+            SortPref {
+                metric: Some(vec!["rows".into()]),
+                descending: true
+            }
+        );
+        let again = App::new(vec![Box::new(Fake(vec!["x"]))], path.clone());
+        assert_eq!(again.sort_id(0).as_deref(), Some("rows"));
+        fs::remove_file(&path).unwrap();
+    }
+
+    fn screen(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_field_renders_with_the_sort_metric_marked_and_the_rest_scrolling() {
+        let path = scratch("render");
+        let _ = fs::remove_file(&path);
+        let mut app = App::new(vec![Box::new(Fake(vec!["nick", "work"]))], path.clone());
+        let soon = (chrono_now() + 3 * 3600).to_string();
+        let response = |session: f64, rows: u32| {
+            serde_json::json!({
+                "five_hour": {"utilization": session, "resets_at": soon.parse::<i64>().unwrap()},
+                "seven_day": {"utilization": 42.5},
+                "limits": [
+                    {"kind": "session", "percent": session, "severity": "normal"},
+                    {"kind": "weekly_scoped", "percent": 78, "severity": "warning",
+                     "scope": {"model": {"display_name": "Fable"}}}
+                ],
+                "extra_usage": {"used_credits": 12.5, "monthly_limit": 50, "is_enabled": true},
+                "rows": rows,
+                "organization": {"tier": "max"}
+            })
+        };
+        app.usage.insert(
+            (0, "nick".into()),
+            UsageState::Ready(parse_usage(&response(60.0, 4521))),
+        );
+        app.usage.insert(
+            (0, "work".into()),
+            UsageState::Ready(parse_usage(&response(5.0, 9000))),
+        );
+        let wide = screen(&app, 110, 32);
+        println!("{wide}");
+        assert!(wide.contains("fake accounts (2) · ↑ five hour · utilization"));
+        app.usage.insert(
+            (0, "work".into()),
+            UsageState::Ready(parse_usage(
+                &serde_json::json!({"limits": [{"kind": "session", "percent": 5}]}),
+            )),
+        );
+        app.usage.insert(
+            (0, "nick".into()),
+            UsageState::Ready(parse_usage(
+                &serde_json::json!({"limits": [{"kind": "session", "percent": 60}]}),
+            )),
+        );
+        let shared = screen(&app, 110, 32);
+        assert!(shared.contains("fake accounts (2) · ↑ session · percent"));
+        assert!(shared.contains("↑ session · percent "));
+        assert!(!shared.contains("limits"));
+        app.usage.insert(
+            (0, "nick".into()),
+            UsageState::Ready(parse_usage(&response(60.0, 4521))),
+        );
+        app.usage.insert(
+            (0, "work".into()),
+            UsageState::Ready(parse_usage(&response(5.0, 9000))),
+        );
+        let (nick_row, work_row) = (wide.find("nick").unwrap(), wide.find("work").unwrap());
+        assert!(work_row < nick_row, "lower utilization sorts first");
+        for expected in [
+            "↑ five hour · utilization",
+            "  seven day · utilization",
+            "  limits · session · percent",
+            "  limits · weekly scoped · percent",
+            "  extra usage · used credits",
+            "  extra usage · monthly limit",
+            "  rows",
+            "── details",
+            "  limits · weekly scoped · scope · model · display name  Fable",
+            "  limits · session · severity",
+            "  organization · tier",
+            "  extra usage · is enabled",
+            "resets in 2h 59m",
+            "4,521",
+            "60%",
+            "42.5%",
+            "yes",
+            "max",
+        ] {
+            assert!(wide.contains(expected), "missing {expected:?} in\n{wide}");
+        }
+        assert!(!wide.contains("12.50"), "trailing zeros trimmed");
+
+        press(&mut app, KeyCode::Char('s'));
+        let picker = screen(&app, 110, 32);
+        println!("{picker}");
+        assert!(picker.contains("sort fake accounts by"));
+        assert!(picker.contains("▶ ↑ five hour · utilization"));
+        assert!(picker.contains("rows"));
+        press(&mut app, KeyCode::Esc);
+
+        let narrow = screen(&app, 70, 18);
+        println!("{narrow}");
+        assert!(narrow.contains("pgup/pgdn"));
+        assert!(!narrow.contains("resets in"));
+        assert!(narrow.lines().all(|l| l.chars().count() <= 70));
+        assert!(narrow.contains("1-"));
+        press(&mut app, KeyCode::PageDown);
+        let scrolled = screen(&app, 70, 18);
+        println!("{scrolled}");
+        assert!(scrolled.contains("── details"));
+        assert!(!scrolled.contains("1-"));
+        let _ = fs::remove_file(&path);
+    }
+
+    fn chrono_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 }

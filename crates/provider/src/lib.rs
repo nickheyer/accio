@@ -16,7 +16,10 @@ use serde_json::Value;
 
 pub use fsutil::{read_json, sanitize_name, write_atomic};
 pub use swap::{Backend, Swap};
-pub use usage::{humanize_until, parse_usage, Fact, Severity, Usage, Window};
+pub use usage::{
+    common_prefix, humanize_until, humanize_when, label, parse_usage, Metric, MetricValue, Scale,
+    Until, Usage,
+};
 
 // One setting a hand-configured profile can carry
 #[derive(Clone)]
