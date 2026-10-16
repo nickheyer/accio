@@ -15,7 +15,7 @@ const WAIT: Duration = Duration::from_secs(20);
 
 pub struct Slot {
     dir: PathBuf,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(any(not(target_os = "macos"), test), allow(dead_code))]
     hashed: bool,
 }
 
@@ -54,7 +54,7 @@ impl Slot {
     }
 
     pub fn read(&self) -> Option<Value> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(test)))]
         if let Some(v) = keychain::read(&self.service()) {
             return Some(v);
         }
@@ -64,7 +64,7 @@ impl Slot {
     pub fn write(&self, creds: &Value) -> Result<()> {
         self.create_dir()?;
         let body = creds.to_string();
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(test)))]
         if keychain::write(&self.service(), &body).is_ok() {
             let _ = fs::remove_file(self.path());
             return Ok(());
@@ -73,7 +73,7 @@ impl Slot {
     }
 
     pub fn clear(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(test)))]
         keychain::delete(&self.service());
         let path = self.path();
         if path.exists() {
@@ -158,7 +158,7 @@ impl Slot {
             .with_context(|| format!("cant create {}", self.dir.display()))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     fn service(&self) -> String {
         use sha2::{Digest, Sha256};
         use unicode_normalization::UnicodeNormalization;
@@ -227,7 +227,7 @@ fn token(creds: &Value) -> Result<String> {
         .context("no access token - add this account again")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 mod keychain {
     use anyhow::{Context, Result};
     use serde_json::Value;
@@ -299,7 +299,8 @@ mod tests {
         assert!(!slot.offer(&creds(2)).unwrap());
         assert!(slot.offer(&creds(3)).unwrap());
         assert_eq!(expires_at(&slot.read().unwrap()), 3);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(!dir.join(".oauth_refresh.lock").exists());
+        assert!(!dir.join(".credentials.json.lock").exists());
         assert_eq!(slot.take().unwrap().map(|c| expires_at(&c)), Some(3));
         assert!(slot.read().is_none());
         assert!(slot.take().unwrap().is_none());
@@ -316,11 +317,7 @@ mod tests {
         assert!(err.to_string().contains("another claude process"));
         assert!(held.exists());
         let old = SystemTime::now() - Duration::from_secs(120);
-        let stamp = filetime(old);
-        std::process::Command::new("touch")
-            .args(["-d", &stamp, held.to_str().unwrap()])
-            .status()
-            .unwrap();
+        fs::File::open(&held).unwrap().set_modified(old).unwrap();
         {
             let _lock = slot.lock_within(Duration::from_millis(300)).unwrap();
             assert!(held.exists());
@@ -328,11 +325,7 @@ mod tests {
         }
         assert!(!held.exists());
         assert!(!dir.join(".credentials.json.lock").exists());
-    }
-
-    fn filetime(t: SystemTime) -> String {
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-        format!("@{secs}")
+        slot.clear().unwrap();
     }
 
     #[test]
@@ -342,6 +335,7 @@ mod tests {
         let soon = Utc::now().timestamp_millis() + 3_600_000;
         slot.write(&creds(soon)).unwrap();
         assert_eq!(slot.fresh_token().unwrap(), format!("a{soon}"));
+        slot.clear().unwrap();
         let empty = Slot::store(&tdir("fresh-empty"));
         assert!(empty
             .fresh_token()

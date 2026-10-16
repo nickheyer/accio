@@ -14,7 +14,8 @@ use std::process::Command;
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-pub use fsutil::{read_json, sanitize_name, write_atomic};
+pub use fsutil::{contract, expand, read_json, sanitize_name, write_atomic};
+pub use overlay::canon_str;
 pub use swap::{Backend, Swap};
 pub use usage::{
     common_prefix, humanize_until, humanize_when, label, parse_usage, Metric, MetricValue, Scale,
@@ -84,6 +85,11 @@ pub trait Provider {
         Vec::new()
     }
 
+    // Whether add can run a login instead of a configure form
+    fn can_login(&self) -> bool {
+        true
+    }
+
     // store a profile built from knob values, nothing goes live yet
     fn configure(
         &mut self,
@@ -111,7 +117,7 @@ pub trait Provider {
         Ok(())
     }
 
-    // label/value pairs shown while the provider has no accounts yet
+    // Label value pairs the tab's info panel shows
     fn info(&self) -> Vec<(String, String)> {
         Vec::new()
     }

@@ -9,7 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use accio_provider::{
-    files, parse_usage, read_json, write_atomic, Backend, Job, Knob, Outcome, Provider, Swap,
+    contract, files, parse_usage, read_json, write_atomic, Backend, Job, Knob, Outcome, Provider,
+    Swap,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -252,6 +253,22 @@ impl Backend for Claude {
         &["claude", "/login"]
     }
 
+    fn info(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "credentials".to_string(),
+                self.pointer()
+                    .map(|d| contract(&d))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ("live".to_string(), contract(&self.live.path())),
+            ("identity".to_string(), contract(&self.claude_json_path)),
+            ("settings".to_string(), contract(&self.settings_path)),
+            ("sessions".to_string(), contract(&self.sessions)),
+            ("login".to_string(), self.login().join(" ")),
+        ]
+    }
+
     fn knobs(&self) -> Vec<Knob> {
         vec![
             Knob::new("ANTHROPIC_BASE_URL", "endpoint claude code talks to"),
@@ -400,7 +417,7 @@ fn migrate_flat_profiles() {
     };
     let dir = accounts.join("claude");
     for path in entries.flatten().map(|e| e.path()) {
-        if !path.is_file() || path.extension().map_or(true, |e| e != "json") {
+        if !path.is_file() || path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let name = match path.file_stem().and_then(|s| s.to_str()) {

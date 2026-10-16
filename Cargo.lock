@@ -8,6 +8,7 @@ version = "0.0.8"
 dependencies = [
  "accio-claude",
  "accio-codex",
+ "accio-custom",
  "accio-gemini",
  "accio-grok",
  "accio-provider",
@@ -38,6 +39,16 @@ version = "0.0.8"
 dependencies = [
  "accio-provider",
  "anyhow",
+ "serde_json",
+]
+
+[[package]]
+name = "accio-custom"
+version = "0.0.8"
+dependencies = [
+ "accio-provider",
+ "anyhow",
+ "dirs",
  "serde_json",
 ]
 

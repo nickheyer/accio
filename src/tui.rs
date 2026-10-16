@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+use accio_custom::{Definition, Draft, Registry};
 use accio_provider::{
-    common_prefix, humanize_until, label, read_json, write_atomic, Account, Fetch, Knob, Metric,
-    MetricValue, Outcome, Provider, Scale, Usage,
+    common_prefix, contract, humanize_until, label, read_json, write_atomic, Account, Fetch, Knob,
+    Metric, MetricValue, Outcome, Provider, Scale, Usage,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -18,6 +19,8 @@ use serde_json::{json, Map, Value};
 const BAR: Color = Color::Cyan;
 const SCROLL_STEP: usize = 5;
 
+type Build = fn(&Registry) -> Result<Vec<Box<dyn Provider>>>;
+
 enum UsageState {
     Loading,
     Ready(Usage),
@@ -25,6 +28,7 @@ enum UsageState {
 }
 
 struct FetchMsg {
+    generation: usize,
     provider: usize,
     account: String,
     outcome: Outcome,
@@ -35,7 +39,9 @@ enum Mode {
     AddMethod(usize),
     Form(Form),
     ConfirmDelete(String),
+    ConfirmRemove(String),
     SortPicker(usize),
+    Providers(usize),
 }
 
 const ADD_METHODS: [&str; 2] = [
@@ -130,40 +136,56 @@ struct Form {
     fields: Vec<Field>,
     focus: usize,
     action: FormAction,
+    width: u16,
 }
 
 enum FormAction {
     Login,
     Configure { editing: Option<String> },
+    NewProvider,
+    Definition { name: String },
 }
 
+#[derive(Clone)]
 struct Field {
     label: String,
     hint: String,
     value: String,
     secret: bool,
-    extra: bool,
+    // Filled rows of this kind spawn a blank one below
+    grows: bool,
 }
 
 impl Field {
-    fn knob(k: &Knob) -> Self {
+    fn new(label: &str, hint: &str) -> Self {
         Field {
-            label: k.name.clone(),
-            hint: format!("{} (optional)", k.hint),
+            label: label.to_string(),
+            hint: hint.to_string(),
             value: String::new(),
-            secret: k.secret,
-            extra: false,
+            secret: false,
+            grows: false,
         }
     }
 
+    fn row(label: &str, hint: &str) -> Self {
+        let mut f = Field::new(label, hint);
+        f.grows = true;
+        f
+    }
+
+    fn with(mut self, value: &str) -> Self {
+        self.value = value.to_string();
+        self
+    }
+
+    fn knob(k: &Knob) -> Self {
+        let mut f = Field::new(&k.name, &format!("{} (optional)", k.hint));
+        f.secret = k.secret;
+        f
+    }
+
     fn extra() -> Self {
-        Field {
-            label: "extra".to_string(),
-            hint: "KEY=VALUE (optional)".to_string(),
-            value: String::new(),
-            secret: false,
-            extra: true,
-        }
+        Field::row("extra", "KEY=VALUE (optional)")
     }
 }
 
@@ -171,26 +193,15 @@ impl Form {
     fn login(provider: &str) -> Self {
         Form {
             title: format!(" add {provider} account "),
-            fields: vec![Field {
-                label: "name".to_string(),
-                hint: "defaults to the account email".to_string(),
-                value: String::new(),
-                secret: false,
-                extra: false,
-            }],
+            fields: vec![Field::new("name", "defaults to the account email")],
             focus: 0,
             action: FormAction::Login,
+            width: 66,
         }
     }
 
     fn configure(provider: &str, knobs: &[Knob]) -> Self {
-        let mut fields = vec![Field {
-            label: "name".to_string(),
-            hint: "profile name".to_string(),
-            value: String::new(),
-            secret: false,
-            extra: false,
-        }];
+        let mut fields = vec![Field::new("name", "profile name")];
         fields.extend(knobs.iter().map(Field::knob));
         fields.push(Field::extra());
         Form {
@@ -198,6 +209,67 @@ impl Form {
             fields,
             focus: 0,
             action: FormAction::Configure { editing: None },
+            width: 66,
+        }
+    }
+
+    fn new_provider() -> Self {
+        Form {
+            title: " new provider ".to_string(),
+            fields: vec![
+                Field::new(
+                    "name",
+                    "lowercase letters, digits, - or _ (pi loads the bundled preset)",
+                ),
+                Field::new(
+                    "command",
+                    "program to run, blank keeps the preset or the name",
+                ),
+            ],
+            focus: 0,
+            action: FormAction::NewProvider,
+            width: 80,
+        }
+    }
+
+    // One row per list entry with a blank row under each list
+    fn definition(draft: &Draft) -> Self {
+        let rows = |label: &str, hint: &str, lines: &[String]| -> Vec<Field> {
+            lines
+                .iter()
+                .map(|l| Field::row(label, hint).with(l))
+                .chain([Field::row(label, hint)])
+                .collect()
+        };
+        let mut fields = vec![
+            Field::new("command", "program and arguments, defaults to the name")
+                .with(&draft.command),
+            Field::new("home", "the harness config directory, ~/ or absolute").with(&draft.home),
+            Field::new("home_env", "variable that relocates home, sessions need it")
+                .with(&draft.home_env),
+            Field::new("copy", "comma separated, what a session takes from home").with(&draft.copy),
+            Field::new("unset", "comma separated variables scrubbed from sessions")
+                .with(&draft.unset),
+        ];
+        fields.extend(rows("env", "KEY=VALUE set in every session", &draft.env));
+        fields.extend(rows(
+            "knob",
+            "NAME hint, a leading * masks the value",
+            &draft.knobs,
+        ));
+        fields.extend(rows(
+            "file",
+            "path {json template}, merge: prefix deep merges",
+            &draft.files,
+        ));
+        Form {
+            title: format!(" define '{}' ", draft.name),
+            fields,
+            focus: 0,
+            action: FormAction::Definition {
+                name: draft.name.clone(),
+            },
+            width: 100,
         }
     }
 
@@ -223,17 +295,28 @@ impl Form {
             action: FormAction::Configure {
                 editing: Some(name.to_string()),
             },
+            width: 66,
         }
     }
 
-    // Filled last extra row spawns a fresh one below
+    // A filled row that ends its run spawns a blank one below
     fn grow(&mut self) {
-        if self
-            .fields
-            .last()
-            .is_some_and(|f| f.extra && !f.value.trim().is_empty())
-        {
-            self.fields.push(Field::extra());
+        let mut i = 0;
+        while i < self.fields.len() {
+            let f = &self.fields[i];
+            let ends_run = self
+                .fields
+                .get(i + 1)
+                .is_none_or(|n| !n.grows || n.label != f.label);
+            if f.grows && ends_run && !f.value.trim().is_empty() {
+                let mut blank = f.clone();
+                blank.value.clear();
+                self.fields.insert(i + 1, blank);
+                if i < self.focus {
+                    self.focus += 1;
+                }
+            }
+            i += 1;
         }
     }
 }
@@ -247,8 +330,10 @@ enum Action {
 
 pub fn run() -> Result<()> {
     let providers = crate::providers()?;
+    let prefs = prefs_path()?;
+    let registry_dir = accio_custom::dir()?;
     let mut terminal = ratatui::init();
-    let result = App::new(providers, prefs_path()?)
+    let result = App::new(providers, prefs, registry_dir)
         .run(&mut terminal)
         .map(|_| ());
     ratatui::restore();
@@ -269,7 +354,7 @@ pub fn pick_session(provider: Box<dyn Provider>) -> Result<Option<(Box<dyn Provi
         "the profile picker needs a terminal - use `accio {} --profile NAME` instead",
         provider.name()
     );
-    let mut app = App::new(vec![provider], prefs_path()?);
+    let mut app = App::new(vec![provider], prefs_path()?, accio_custom::dir()?);
     app.session_picker = true;
     app.status = "Choose a profile for this session".into();
     let mut terminal = ratatui::init();
@@ -291,10 +376,16 @@ struct App {
     prefs: Prefs,
     prefs_path: PathBuf,
     usage_scroll: Cell<usize>,
+    registry_dir: PathBuf,
+    build: Build,
+    // What the providers overlay lists, refreshed on open and after every change
+    definitions: Vec<Definition>,
+    // Bumped when tabs are rebuilt so fetches for the old tabs are dropped
+    generation: usize,
 }
 
 impl App {
-    fn new(providers: Vec<Box<dyn Provider>>, prefs_path: PathBuf) -> Self {
+    fn new(providers: Vec<Box<dyn Provider>>, prefs_path: PathBuf, registry_dir: PathBuf) -> Self {
         let (tx, rx) = channel();
         let selected: Vec<usize> = providers.iter().map(|p| p.active().unwrap_or(0)).collect();
         App {
@@ -310,7 +401,56 @@ impl App {
             prefs: Prefs::load(&prefs_path),
             prefs_path,
             usage_scroll: Cell::new(0),
+            registry_dir,
+            build: crate::providers_in,
+            definitions: Vec::new(),
+            generation: 0,
         }
+    }
+
+    fn registry(&self) -> Result<Registry> {
+        Registry::load_at(self.registry_dir.clone())
+    }
+
+    // Tabs rebuilt from the registry, the named provider focused when it has a tab
+    fn reload_providers(&mut self, focus: Option<&str>) {
+        let registry = match self.registry() {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("{e:#}");
+                return;
+            }
+        };
+        let providers = match (self.build)(&registry) {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => {
+                self.status = "every provider is disabled".into();
+                return;
+            }
+            Err(e) => {
+                self.status = format!("{e:#}");
+                return;
+            }
+        };
+        let current = focus
+            .map(str::to_string)
+            .unwrap_or_else(|| self.providers[self.tab].name().to_string());
+        self.definitions = registry.definitions;
+        self.providers = providers;
+        self.tab = self
+            .providers
+            .iter()
+            .position(|p| p.name() == current)
+            .unwrap_or(0);
+        self.selected = self
+            .providers
+            .iter()
+            .map(|p| p.active().unwrap_or(0))
+            .collect();
+        self.usage.clear();
+        self.usage_scroll.set(0);
+        self.generation += 1;
+        self.fetch_all();
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<usize>> {
@@ -354,9 +494,13 @@ impl App {
             self.on_key_picker(cursor, key);
             return Ok(Action::None);
         }
+        if let Mode::Providers(cursor) = self.mode {
+            self.on_key_providers(cursor, key);
+            return Ok(Action::None);
+        }
         match &mut self.mode {
             Mode::Normal => return self.on_key_normal(key),
-            Mode::SortPicker(_) => {}
+            Mode::SortPicker(_) | Mode::Providers(_) => {}
             Mode::AddMethod(selected) => match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Up
@@ -383,8 +527,11 @@ impl App {
             },
             Mode::Form(form) => match key.code {
                 KeyCode::Esc => {
+                    self.status = match &form.action {
+                        FormAction::Definition { name } => format!("'{name}' left as written"),
+                        _ => "cancelled".into(),
+                    };
                     self.mode = Mode::Normal;
-                    self.status = "cancelled".into();
                 }
                 KeyCode::Up | KeyCode::BackTab => form.focus = form.focus.saturating_sub(1),
                 KeyCode::Down | KeyCode::Tab => {
@@ -409,6 +556,26 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::ConfirmRemove(name) => {
+                let name = name.clone();
+                let cursor = self
+                    .definitions
+                    .iter()
+                    .position(|d| d.name == name)
+                    .unwrap_or(0);
+                self.mode = Mode::Providers(cursor);
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    match self.registry().and_then(|r| r.remove(&name)) {
+                        Ok(()) => {
+                            self.status = format!("removed '{name}' - its profiles stay on disk");
+                            self.reload_providers(None);
+                            let last = self.definitions.len().saturating_sub(1);
+                            self.mode = Mode::Providers(cursor.min(last));
+                        }
+                        Err(e) => self.status = format!("remove failed: {e:#}"),
+                    }
+                }
+            }
             Mode::ConfirmDelete(name) => {
                 let name = name.clone();
                 self.mode = Mode::Normal;
@@ -468,14 +635,74 @@ impl App {
             let v = f.value.trim().to_string();
             (!v.is_empty()).then_some(v)
         };
-        match form.action {
+        match &form.action {
             FormAction::Login => Ok(Action::Add(form.fields.first().and_then(field_value))),
+            FormAction::NewProvider => {
+                let name = form
+                    .fields
+                    .first()
+                    .and_then(field_value)
+                    .unwrap_or_default();
+                let command = form.fields.get(1).and_then(field_value);
+                match self
+                    .registry()
+                    .and_then(|r| r.add(&name, command.as_deref()))
+                {
+                    Ok(path) => {
+                        self.status = format!("defined '{name}' in {}", contract(&path));
+                        self.reload_providers(Some(&name));
+                        match self.registry().and_then(|r| r.draft(&name)) {
+                            Ok(draft) => self.mode = Mode::Form(Form::definition(&draft)),
+                            Err(e) => self.status = format!("{e:#}"),
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("new provider failed: {e:#}");
+                        self.mode = Mode::Form(form);
+                    }
+                }
+                Ok(Action::None)
+            }
+            FormAction::Definition { name } => {
+                let name = name.clone();
+                let mut draft = Draft {
+                    name: name.clone(),
+                    ..Draft::default()
+                };
+                for f in &form.fields {
+                    let v = f.value.trim().to_string();
+                    match f.label.as_str() {
+                        "command" => draft.command = v,
+                        "home" => draft.home = v,
+                        "home_env" => draft.home_env = v,
+                        "copy" => draft.copy = v,
+                        "unset" => draft.unset = v,
+                        _ if v.is_empty() => {}
+                        "env" => draft.env.push(v),
+                        "knob" => draft.knobs.push(v),
+                        "file" => draft.files.push(v),
+                        _ => {}
+                    }
+                }
+                match self.registry().and_then(|r| r.save(&draft)) {
+                    Ok(_) => {
+                        self.status = format!("saved '{name}'");
+                        self.reload_providers(Some(&name));
+                    }
+                    Err(e) => {
+                        // The form stays up so the fix is a keystroke away
+                        self.status = format!("save failed: {e:#}");
+                        self.mode = Mode::Form(form);
+                    }
+                }
+                Ok(Action::None)
+            }
             FormAction::Configure { editing } => {
-                let mut name = editing;
+                let mut name = editing.clone();
                 let mut values = BTreeMap::new();
                 for f in &form.fields {
                     let Some(v) = field_value(f) else { continue };
-                    if f.extra {
+                    if f.grows {
                         if let Some((k, v)) = v.split_once('=') {
                             if !k.trim().is_empty() {
                                 values.insert(k.trim().to_string(), v.trim().to_string());
@@ -578,12 +805,27 @@ impl App {
             },
             KeyCode::Char('a') if !self.session_picker => {
                 let p = &self.providers[self.tab];
-                self.mode = if p.knobs().is_empty() {
+                self.mode = if !p.can_login() {
+                    Mode::Form(Form::configure(p.name(), &p.knobs()))
+                } else if p.knobs().is_empty() {
                     Mode::Form(Form::login(p.name()))
                 } else {
                     Mode::AddMethod(0)
                 };
             }
+            KeyCode::Char('p') if !self.session_picker => match self.registry() {
+                Ok(registry) => {
+                    let current = self.providers[self.tab].name();
+                    let cursor = registry
+                        .definitions
+                        .iter()
+                        .position(|d| d.name == current)
+                        .unwrap_or(0);
+                    self.definitions = registry.definitions;
+                    self.mode = Mode::Providers(cursor);
+                }
+                Err(e) => self.status = format!("{e:#}"),
+            },
             KeyCode::Char('e') if !self.session_picker => {
                 if n == 0 {
                     return Ok(Action::None);
@@ -627,6 +869,57 @@ impl App {
             _ => {}
         }
         Ok(Action::None)
+    }
+
+    fn on_key_providers(&mut self, cursor: usize, key: KeyEvent) {
+        let count = self.definitions.len();
+        let cursor = cursor.min(count.saturating_sub(1));
+        let def = self.definitions.get(cursor).cloned();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::Providers(cursor.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::Providers((cursor + 1).min(count.saturating_sub(1)));
+            }
+            KeyCode::Char('n') => self.mode = Mode::Form(Form::new_provider()),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(def) = def else { return };
+                let enabled = self.definitions.iter().filter(|d| !d.disabled).count();
+                if !def.disabled && enabled <= 1 {
+                    self.status = "one provider has to stay enabled".into();
+                    return;
+                }
+                match self
+                    .registry()
+                    .and_then(|r| r.set_disabled(&def.name, !def.disabled))
+                {
+                    Ok(()) => {
+                        let verb = if def.disabled { "enabled" } else { "disabled" };
+                        self.status = format!("{verb} '{}'", def.name);
+                        self.reload_providers(None);
+                    }
+                    Err(e) => self.status = format!("{e:#}"),
+                }
+            }
+            KeyCode::Char('e') => {
+                let Some(def) = def else { return };
+                match self.registry().and_then(|r| r.draft(&def.name)) {
+                    Ok(draft) => self.mode = Mode::Form(Form::definition(&draft)),
+                    Err(e) => self.status = format!("{e:#}"),
+                }
+            }
+            KeyCode::Char('d') => {
+                let Some(def) = def else { return };
+                if def.builtin {
+                    self.status = format!("'{}' is built in - disable it instead", def.name);
+                } else {
+                    self.mode = Mode::ConfirmRemove(def.name);
+                }
+            }
+            _ => {}
+        }
     }
 
     // Moves the selection through the sorted list, wrapping at both ends
@@ -779,8 +1072,10 @@ impl App {
                 self.usage
                     .insert((pi, account.clone()), UsageState::Loading);
                 let tx = self.tx.clone();
+                let generation = self.generation;
                 std::thread::spawn(move || {
                     let _ = tx.send(FetchMsg {
+                        generation,
                         provider: pi,
                         account,
                         outcome: job(),
@@ -793,6 +1088,9 @@ impl App {
 
     fn drain_fetches(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
+            if msg.generation != self.generation {
+                continue;
+            }
             if let Some(state) = msg.outcome.state {
                 if let Some(p) = self.providers.get_mut(msg.provider) {
                     if let Err(e) = p.absorb_fetch(&msg.account, state) {
@@ -814,23 +1112,121 @@ impl App {
 
     fn render(&self, f: &mut Frame) {
         let list_height = (self.providers[self.tab].accounts().len() as u16 + 2).max(3);
-        let [tabs_area, accounts_area, usage_area, footer_area] = Layout::vertical([
+        let info = self.providers[self.tab].info();
+        let info_height = if info.is_empty() {
+            0
+        } else {
+            info.len() as u16 + 2
+        };
+        let [tabs_area, accounts_area, info_area, usage_area, footer_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(list_height),
+            Constraint::Length(info_height),
             Constraint::Min(4),
-            Constraint::Length(2),
+            Constraint::Length(self.footer_height(f.area().width)),
         ])
         .areas(f.area());
         self.render_tabs(f, tabs_area);
         self.render_accounts(f, accounts_area);
+        if !info.is_empty() {
+            render_info(f, info_area, &info);
+        }
         self.render_usage(f, usage_area);
         self.render_footer(f, footer_area);
         match &self.mode {
             Mode::AddMethod(selected) => self.render_menu(f, *selected),
             Mode::Form(form) => render_form(f, form),
             Mode::SortPicker(cursor) => self.render_sort_picker(f, *cursor),
+            Mode::Providers(_) | Mode::ConfirmRemove(_) => {
+                self.render_providers(f, self.providers_cursor());
+            }
             _ => {}
         }
+    }
+
+    // Overlay cursor, the confirm prompt keeps the row it asks about
+    fn providers_cursor(&self) -> usize {
+        match &self.mode {
+            Mode::Providers(cursor) => *cursor,
+            Mode::ConfirmRemove(name) => self
+                .definitions
+                .iter()
+                .position(|d| d.name == *name)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn render_providers(&self, f: &mut Frame, cursor: usize) {
+        let defs = &self.definitions;
+        let name_w = defs
+            .iter()
+            .map(|d| d.name.chars().count())
+            .max()
+            .unwrap_or(6)
+            .clamp(6, 20);
+        let path_w = 40;
+        let items: Vec<ListItem> = defs
+            .iter()
+            .map(|d| {
+                let (state, style) = if d.disabled {
+                    ("disabled", Style::new().dim())
+                } else {
+                    ("enabled ", Style::new().green())
+                };
+                let kind = if d.builtin { "built in" } else { "custom  " };
+                let detail = if d.builtin {
+                    String::new()
+                } else {
+                    contract(&d.path)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        pad(&d.name, name_w),
+                        if d.disabled {
+                            Style::new().dim()
+                        } else {
+                            Style::new()
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(state.to_string(), style),
+                    Span::raw("  "),
+                    Span::styled(kind.to_string(), Style::new().dim()),
+                    Span::raw("  "),
+                    Span::styled(tail(&detail, path_w), Style::new().dim()),
+                ]))
+            })
+            .collect();
+        let rect = centered(
+            f.area(),
+            (name_w + 8 + 8 + path_w + 14) as u16,
+            items.len() as u16 + 5,
+        );
+        f.render_widget(Clear, rect);
+        let block = panel(" providers ".to_string());
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let [list_area, hint_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+        let mut state = ListState::default().with_selected(Some(cursor));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▶ ")
+                .highlight_style(Style::new().bold()),
+            list_area,
+            &mut state,
+        );
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::styled(
+                    "enter enable/disable · n new · e edit · d remove · esc close",
+                    Style::new().dim(),
+                ),
+            ]),
+            hint_area,
+        );
     }
 
     fn render_menu(&self, f: &mut Frame, selected: usize) {
@@ -1081,7 +1477,7 @@ impl App {
         let p = &self.providers[self.tab];
         let rows = p.accounts();
         let (mut title, lines) = if rows.is_empty() {
-            (" usage ".to_string(), info_lines(p.as_ref()))
+            (" usage ".to_string(), Vec::new())
         } else {
             let name = rows
                 .get(self.selected[self.tab])
@@ -1208,26 +1604,41 @@ impl App {
         lines
     }
 
+    fn help(&self) -> &'static str {
+        if self.session_picker {
+            "↑/↓ select · enter launch session · s/S sort · r refresh · q/esc cancel"
+        } else {
+            "←/→ provider · ↑/↓ select · enter switch · s/S sort · a add · e edit · d delete · p providers · r refresh · q quit"
+        }
+    }
+
+    // Status line plus however many lines the help wraps onto
+    fn footer_height(&self, width: u16) -> u16 {
+        let usable = width.saturating_sub(4).max(1) as usize;
+        1 + self.help().chars().count().div_ceil(usable) as u16
+    }
+
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let top_line = match &self.mode {
             Mode::ConfirmDelete(name) => Line::styled(
                 format!("delete '{name}' from accio? (y/N)"),
                 Style::new().yellow().bold(),
             ),
+            Mode::ConfirmRemove(name) => Line::styled(
+                format!("remove provider '{name}'? its profiles stay on disk (y/N)"),
+                Style::new().yellow().bold(),
+            ),
             _ => Line::styled(self.status.clone(), Style::new().cyan()),
         };
-        let help = Line::styled(
-            if self.session_picker {
-                "↑/↓ select · enter launch session · s/S sort · r refresh · q/esc cancel"
-            } else {
-                "←/→ provider · ↑/↓ select · enter switch · s/S sort · a add · e edit · d delete · r refresh · q quit"
-            },
-            Style::new().dim(),
-        );
+        let [status_area, help_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        let padded = || Block::new().padding(Padding::horizontal(2));
+        f.render_widget(Paragraph::new(top_line).block(padded()), status_area);
         f.render_widget(
-            Paragraph::new(vec![top_line, help])
-                .block(Block::new().padding(Padding::horizontal(2))),
-            area,
+            Paragraph::new(Line::styled(self.help(), Style::new().dim()))
+                .wrap(Wrap { trim: true })
+                .block(padded()),
+            help_area,
         );
     }
 }
@@ -1240,14 +1651,19 @@ fn render_form(f: &mut Frame, form: &Form) {
         .max()
         .unwrap_or(4)
         .clamp(4, 26);
-    let rect = centered(f.area(), 66, form.fields.len() as u16 + 4);
+    let rect = centered(f.area(), form.width, form.fields.len() as u16 + 4);
     f.render_widget(Clear, rect);
-    // borders, padding, marker, label and the gap after it
-    let value_w = (rect.width as usize)
-        .saturating_sub(4 + 2 + label_w + 2)
+    let block = panel(form.title.clone());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let [fields_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+    // marker, label, the gap after it and the cursor
+    let value_w = (inner.width as usize)
+        .saturating_sub(2 + label_w + 2 + 1)
         .max(8);
 
-    let mut lines: Vec<Line> = form
+    let lines: Vec<Line> = form
         .fields
         .iter()
         .enumerate()
@@ -1275,7 +1691,12 @@ fn render_form(f: &mut Frame, form: &Form) {
                 } else {
                     fl.value.clone()
                 };
-                spans.push(Span::raw(tail(&shown, value_w)));
+                // The focused row shows where typing lands, the rest their start
+                spans.push(Span::raw(if focused {
+                    tail(&shown, value_w)
+                } else {
+                    clip(&shown, value_w)
+                }));
             }
             if focused {
                 spans.push(Span::styled("▏", Style::new().dim()));
@@ -1283,12 +1704,22 @@ fn render_form(f: &mut Frame, form: &Form) {
             Line::from(spans)
         })
         .collect();
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "↑/↓ field · enter next, saves on last · esc cancel",
-        Style::new().dim(),
-    ));
-    f.render_widget(Paragraph::new(lines).block(panel(form.title.clone())), rect);
+    let visible = fields_area.height as usize;
+    let scroll = (form.focus + 1).saturating_sub(visible);
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll as u16, 0)),
+        fields_area,
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            Line::styled(
+                "↑/↓ field · enter next, saves on last · esc cancel",
+                Style::new().dim(),
+            ),
+        ]),
+        hint_area,
+    );
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -1313,27 +1744,30 @@ fn tail(s: &str, width: usize) -> String {
         .collect()
 }
 
-// What an empty provider tab manages, straight from the provider itself
-fn info_lines(p: &dyn Provider) -> Vec<Line<'static>> {
-    let info = p.info();
-    if info.is_empty() {
-        return Vec::new();
-    }
+// Where the tab's files live and what it holds, straight from the provider
+fn render_info(f: &mut Frame, area: Rect, info: &[(String, String)]) {
+    let width = area.width.saturating_sub(4) as usize;
     let label_w = info
         .iter()
         .map(|(l, _)| l.chars().count())
         .max()
-        .unwrap_or(0)
+        .unwrap_or(4)
         .clamp(4, 12);
-    let mut lines = vec![Line::raw("")];
-    lines.extend(info.iter().map(|(l, v)| {
-        Line::from(vec![
-            Span::styled(pad(l, label_w), Style::new().dim()),
-            Span::raw("  "),
-            Span::raw(v.clone()),
-        ])
-    }));
-    lines
+    let value_w = width.saturating_sub(label_w + 2).max(8);
+    let lines: Vec<Line> = info
+        .iter()
+        .map(|(l, v)| {
+            Line::from(vec![
+                Span::styled(pad(l, label_w), Style::new().dim()),
+                Span::raw("  "),
+                Span::raw(clip(v, value_w)),
+            ])
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).block(panel(" info ".to_string())),
+        area,
+    );
 }
 
 fn panel(title: String) -> Block<'static> {
@@ -1371,7 +1805,7 @@ fn meter(fill: f64, width: usize, style: Style) -> Vec<Span<'static>> {
     const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
     let eighths = (fill.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
     let mut bar = "█".repeat(eighths / 8);
-    if eighths / 8 < width && eighths % 8 > 0 {
+    if eighths / 8 < width && !eighths.is_multiple_of(8) {
         bar.push(PARTIAL[eighths % 8]);
     }
     let filled = bar.chars().count();
@@ -1462,17 +1896,284 @@ mod tests {
         }
     }
 
+    // A provider under any name, with or without a login command
+    struct Named(String, bool);
+    impl Provider for Named {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn accounts(&self) -> Vec<Account> {
+            Vec::new()
+        }
+        fn active(&self) -> Option<usize> {
+            None
+        }
+        fn activate(&mut self, _: usize) -> Result<()> {
+            panic!("nothing to activate")
+        }
+        fn delete(&mut self, _: &str) -> Result<()> {
+            panic!("nothing to delete")
+        }
+        fn add(&mut self, _: Option<&str>) -> Result<String> {
+            panic!("no login command")
+        }
+        fn fetches(&self) -> Vec<Fetch> {
+            Vec::new()
+        }
+        fn can_login(&self) -> bool {
+            self.1
+        }
+        fn info(&self) -> Vec<(String, String)> {
+            vec![
+                ("profiles".into(), format!("~/accio/accounts/{}", self.0)),
+                (
+                    "login".into(),
+                    if self.1 { self.0.clone() } else { "-".into() },
+                ),
+            ]
+        }
+    }
+
+    #[test]
+    fn info_panel_lists_what_the_provider_reports() {
+        let app = App::new(
+            vec![Box::new(Named("zed".into(), false))],
+            scratch("info"),
+            no_registry(),
+        );
+        let shown = screen(&app, 80, 20);
+        println!("{shown}");
+        assert!(shown.contains("┌ info "));
+        assert!(shown.contains("profiles  ~/accio/accounts/zed"));
+        assert!(shown.contains("login     -"));
+        assert!(shown.contains("┌ usage "));
+        let bare = App::new(
+            vec![Box::new(Fake(vec!["x"]))],
+            scratch("info-bare"),
+            no_registry(),
+        );
+        assert!(!screen(&bare, 80, 20).contains("┌ info "));
+    }
+
+    fn fake_build(registry: &Registry) -> Result<Vec<Box<dyn Provider>>> {
+        Ok(registry
+            .enabled()
+            .map(|d| Box::new(Named(d.name.clone(), d.builtin)) as Box<dyn Provider>)
+            .collect())
+    }
+
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("accio-tui-{}-{name}.json", std::process::id()))
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("accio-tui-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn no_registry() -> PathBuf {
+        std::env::temp_dir().join("accio-tui-no-registry")
     }
 
     fn press(app: &mut App, code: KeyCode) -> Action {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
     }
 
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn custom_provider_without_knobs_gets_a_configure_form() {
+        let mut app = App::new(
+            vec![Box::new(Named("zed".into(), false))],
+            scratch("noknobs"),
+            no_registry(),
+        );
+        press(&mut app, KeyCode::Char('a'));
+        let Mode::Form(form) = &app.mode else {
+            panic!("configure form expected")
+        };
+        assert!(matches!(
+            form.action,
+            FormAction::Configure { editing: None }
+        ));
+        assert_eq!(form.fields[0].label, "name");
+        assert!(form.fields[1].grows);
+    }
+
+    #[test]
+    fn providers_overlay_defines_edits_toggles_and_removes() {
+        let dir = scratch_dir("providers");
+        let registry = Registry::load_at(dir.clone()).unwrap();
+        let mut app = App::new(
+            fake_build(&registry).unwrap(),
+            scratch("providers"),
+            dir.clone(),
+        );
+        app.build = fake_build;
+        assert_eq!(app.providers.len(), 4);
+
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.mode, Mode::Providers(0)));
+        let shown = screen(&app, 100, 30);
+        println!("{shown}");
+        assert!(shown.contains("providers"));
+        assert!(shown.contains("▶ claude"));
+        assert!(shown.contains("built in"));
+        assert!(shown.contains("enabled"));
+
+        // A new provider from the bundled preset lands in its definition form
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "pi");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert!(dir.join("pi.json").exists());
+        assert_eq!(app.providers.len(), 5);
+        assert_eq!(app.providers[app.tab].name(), "pi");
+        let Mode::Form(form) = &app.mode else {
+            panic!("definition form expected")
+        };
+        assert!(matches!(form.action, FormAction::Definition { .. }));
+        assert_eq!(form.fields[0].value, "pi");
+        assert_eq!(form.fields[1].value, "~/.pi/agent");
+        let knobs: Vec<&str> = form
+            .fields
+            .iter()
+            .filter(|f| f.label == "knob")
+            .map(|f| f.value.as_str())
+            .collect();
+        assert_eq!(knobs.len(), 8);
+        assert_eq!(knobs[3], "*API_KEY bearer token for that endpoint");
+        assert_eq!(knobs[7], "");
+        let shown = screen(&app, 100, 30);
+        println!("{shown}");
+        assert!(shown.contains("define 'pi'"));
+        assert!(shown.contains("merge:models.json"));
+        assert!(shown.contains("merge:settings.json"));
+
+        // The command is rewritten, enter walks to the end and saves
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "pi --fast");
+        let mut steps = 0;
+        while matches!(app.mode, Mode::Form(_)) {
+            press(&mut app, KeyCode::Enter);
+            steps += 1;
+            assert!(steps < 40, "form never submitted");
+        }
+        assert_eq!(app.status, "saved 'pi'");
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("pi.json")).unwrap()).unwrap();
+        assert_eq!(saved["command"], json!(["pi", "--fast"]));
+        assert_eq!(saved["knobs"].as_array().unwrap().len(), 7);
+        assert!(saved["files"]["merge:models.json"].is_object());
+        assert_eq!(app.providers[app.tab].name(), "pi");
+
+        // A broken edit keeps the form up with the error in the status line
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.mode, Mode::Providers(4)));
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.mode, Mode::Form(_)));
+        press(&mut app, KeyCode::Down);
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "relative");
+        while matches!(app.mode, Mode::Form(ref f) if f.focus + 1 < f.fields.len()) {
+            press(&mut app, KeyCode::Enter);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.starts_with("save failed: home must start with"));
+        assert!(matches!(app.mode, Mode::Form(_)));
+        press(&mut app, KeyCode::Esc);
+
+        // Toggles, custom and built in alike
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.mode, Mode::Providers(4)));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "disabled 'pi'");
+        assert_eq!(app.providers.len(), 4);
+        assert!(screen(&app, 100, 30).contains("disabled"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "enabled 'pi'");
+        assert_eq!(app.providers.len(), 5);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        assert!(matches!(app.mode, Mode::Providers(0)));
+        press(&mut app, KeyCode::Enter);
+        assert!(dir.join("claude.json").exists());
+        assert_eq!(app.providers.len(), 4);
+        assert_eq!(app.providers[0].name(), "codex");
+        press(&mut app, KeyCode::Enter);
+        assert!(!dir.join("claude.json").exists());
+        assert_eq!(app.providers.len(), 5);
+
+        // Built ins only switch off
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.status.contains("built in"));
+        assert!(matches!(app.mode, Mode::Providers(0)));
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.status.contains("built in"));
+        assert!(matches!(app.mode, Mode::Providers(0)));
+
+        // The last enabled provider stays on
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.providers.len(), 1);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "one provider has to stay enabled");
+        assert_eq!(app.providers.len(), 1);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.providers.len(), 2);
+
+        // Removal asks first, then leaves the overlay on a valid row
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::ConfirmRemove(ref n) if n == "pi"));
+        assert!(screen(&app, 100, 30).contains("remove provider 'pi'?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::Providers(4)));
+        assert!(dir.join("pi.json").exists());
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!dir.join("pi.json").exists());
+        assert!(app.status.starts_with("removed 'pi'"));
+        assert!(matches!(app.mode, Mode::Providers(3)));
+        assert_eq!(app.providers.len(), 1);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        let mut picker = App::new(
+            vec![Box::new(Named("claude".into(), true))],
+            scratch("providers-picker"),
+            dir.clone(),
+        );
+        picker.session_picker = true;
+        press(&mut picker, KeyCode::Char('p'));
+        assert!(matches!(picker.mode, Mode::Normal));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn session_picker_selects_even_active_profile_and_cancels_without_mutating() {
-        let mut app = App::new(vec![Box::new(Fake(vec!["work"]))], scratch("picker"));
+        let mut app = App::new(
+            vec![Box::new(Fake(vec!["work"]))],
+            scratch("picker"),
+            no_registry(),
+        );
         app.session_picker = true;
         for code in [KeyCode::Char('a'), KeyCode::Char('e'), KeyCode::Char('d')] {
             assert!(matches!(press(&mut app, code), Action::None));
@@ -1488,7 +2189,11 @@ mod tests {
     fn accounts_order_by_the_chosen_metric_and_the_choice_persists() {
         let path = scratch("sort");
         let _ = fs::remove_file(&path);
-        let mut app = App::new(vec![Box::new(Fake(vec!["a", "b", "c", "d"]))], path.clone());
+        let mut app = App::new(
+            vec![Box::new(Fake(vec!["a", "b", "c", "d"]))],
+            path.clone(),
+            no_registry(),
+        );
         let ready = |v: Value| UsageState::Ready(parse_usage(&v));
         app.usage.insert(
             (0, "a".into()),
@@ -1519,7 +2224,11 @@ mod tests {
         press(&mut app, KeyCode::Char('S'));
         assert_eq!(app.order(0), vec![1, 2, 0, 3]);
         assert!(app.status.contains("rows ↓"));
-        let mut empty = App::new(vec![Box::new(Fake(vec!["lonely"]))], scratch("empty"));
+        let mut empty = App::new(
+            vec![Box::new(Fake(vec!["lonely"]))],
+            scratch("empty"),
+            no_registry(),
+        );
         press(&mut empty, KeyCode::Char('S'));
         assert_eq!(empty.status, "no metrics to sort by yet");
         assert!(empty.prefs.sort.is_empty());
@@ -1532,7 +2241,7 @@ mod tests {
                 descending: true
             }
         );
-        let again = App::new(vec![Box::new(Fake(vec!["x"]))], path.clone());
+        let again = App::new(vec![Box::new(Fake(vec!["x"]))], path.clone(), no_registry());
         assert_eq!(again.sort_id(0).as_deref(), Some("rows"));
         fs::remove_file(&path).unwrap();
     }
@@ -1558,7 +2267,11 @@ mod tests {
     fn every_field_renders_with_the_sort_metric_marked_and_the_rest_scrolling() {
         let path = scratch("render");
         let _ = fs::remove_file(&path);
-        let mut app = App::new(vec![Box::new(Fake(vec!["nick", "work"]))], path.clone());
+        let mut app = App::new(
+            vec![Box::new(Fake(vec!["nick", "work"]))],
+            path.clone(),
+            no_registry(),
+        );
         let soon = (chrono_now() + 3 * 3600).to_string();
         let response = |session: f64, rows: u32| {
             serde_json::json!({

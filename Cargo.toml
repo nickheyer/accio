@@ -5,6 +5,7 @@ members = [
     "crates/codex",
     "crates/grok",
     "crates/gemini",
+    "crates/custom",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ accio-claude = { path = "crates/claude" }
 accio-codex = { path = "crates/codex" }
 accio-grok = { path = "crates/grok" }
 accio-gemini = { path = "crates/gemini" }
+accio-custom = { path = "crates/custom" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
@@ -37,6 +39,7 @@ accio-claude.workspace = true
 accio-codex.workspace = true
 accio-grok.workspace = true
 accio-gemini.workspace = true
+accio-custom.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 crossterm = "0.28"

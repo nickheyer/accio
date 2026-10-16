@@ -3,17 +3,31 @@ mod tui;
 
 use std::collections::BTreeMap;
 
+use accio_custom::Registry;
 use accio_provider::Provider;
 use anyhow::{bail, Context, Result};
 
-// every provider accio knows about, one crate each
 fn providers() -> Result<Vec<Box<dyn Provider>>> {
-    Ok(vec![
-        Box::new(accio_claude::provider()?),
-        Box::new(accio_codex::provider()?),
-        Box::new(accio_grok::provider()?),
-        Box::new(accio_gemini::provider()?),
-    ])
+    providers_in(&Registry::load()?)
+}
+
+// every enabled provider, built ins from their crates and the rest from definitions
+fn providers_in(registry: &Registry) -> Result<Vec<Box<dyn Provider>>> {
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    for def in registry.enabled() {
+        providers.push(match def.name.as_str() {
+            "claude" => Box::new(accio_claude::provider()?),
+            "codex" => Box::new(accio_codex::provider()?),
+            "grok" => Box::new(accio_grok::provider()?),
+            "gemini" => Box::new(accio_gemini::provider()?),
+            _ => Box::new(accio_custom::provider(def)?),
+        });
+    }
+    anyhow::ensure!(
+        !providers.is_empty(),
+        "every provider is disabled - see `accio provider list`"
+    );
+    Ok(providers)
 }
 
 fn main() {
@@ -25,10 +39,15 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    if let Some(name @ ("claude" | "codex" | "grok" | "gemini")) =
-        args.first().and_then(|a| a.to_str())
+    // A broken definition must surface here, help still works without one
+    if let Some(name) = args
+        .first()
+        .and_then(|a| a.to_str())
+        .filter(|n| !matches!(*n, "help" | "-h" | "--help"))
     {
-        return launch::run(name, &args[1..]);
+        if let Some(def) = Registry::load()?.get(name).cloned() {
+            return launch::run(&def, &args[1..]);
+        }
     }
     let args: Vec<String> = args
         .into_iter()
@@ -43,6 +62,7 @@ fn run() -> Result<()> {
         Some("add") => cmd_add(args.get(1), args.get(2)),
         Some("configure") => cmd_configure(&args[1..]),
         Some("remove") => cmd_remove(args.get(1)),
+        Some("provider") => cmd_provider(&args[1..]),
         Some("help" | "-h" | "--help") => {
             print_help();
             Ok(())
@@ -81,7 +101,7 @@ fn resolve(providers: &[Box<dyn Provider>], spec: &str) -> Result<(usize, usize)
     let matches: Vec<(usize, usize)> = providers
         .iter()
         .enumerate()
-        .filter(|(_, p)| want_provider.map_or(true, |w| p.name() == w))
+        .filter(|(_, p)| want_provider.is_none_or(|w| p.name() == w))
         .flat_map(|(pi, p)| {
             p.accounts()
                 .iter()
@@ -184,6 +204,55 @@ fn cmd_remove(name: Option<&String>) -> Result<()> {
     Ok(())
 }
 
+// definitions come and go on disk, built ins only ever switch off
+fn cmd_provider(args: &[String]) -> Result<()> {
+    let registry = Registry::load()?;
+    let name = args.get(1).map(String::as_str);
+    match (args.first().map(String::as_str), name) {
+        (None | Some("list"), _) => {
+            for d in &registry.definitions {
+                let line = format!(
+                    "{} {:<8} {:<8} {}",
+                    if d.disabled { "-" } else { "*" },
+                    d.name,
+                    if d.builtin { "built in" } else { "custom" },
+                    if d.builtin {
+                        String::new()
+                    } else {
+                        d.path.display().to_string()
+                    }
+                );
+                println!("{}", line.trim_end());
+            }
+        }
+        (Some("add"), Some(name)) => {
+            let path = registry.add(name, args.get(2).map(String::as_str))?;
+            println!("defined '{name}' in {}\nedit it, then `accio configure {name}`", path.display());
+        }
+        (Some("remove"), Some(name)) => {
+            registry.remove(name)?;
+            let profiles = dirs::config_dir()
+                .context("cant determine config dir")?
+                .join("accio")
+                .join("accounts")
+                .join(name);
+            println!("removed '{name}' - its profiles stay in {}", profiles.display());
+        }
+        (Some("enable"), Some(name)) => {
+            registry.set_disabled(name, false)?;
+            println!("enabled '{name}'");
+        }
+        (Some("disable"), Some(name)) => {
+            registry.set_disabled(name, true)?;
+            println!("disabled '{name}'");
+        }
+        _ => bail!(
+            "usage: accio provider [list | add <name> [command] | remove <name> | enable <name> | disable <name>]"
+        ),
+    }
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "accio - switch between provider accounts without re-auth
@@ -196,6 +265,10 @@ usage:
   accio add [provider] [name]                     add currently logged in account or log one in if specified
   accio configure <provider> [name] KEY=VALUE...  for advance profile configuration
   accio remove <your other account>               remove an account from accio
+  accio provider list                             built in and custom providers
+  accio provider add <name> [command]             define a custom provider, then edit the file it prints
+  accio provider remove <name>                    drop a custom provider, its profiles stay on disk
+  accio provider enable|disable <name>            show or hide a provider
   accio help                                      show this help"
     );
 }

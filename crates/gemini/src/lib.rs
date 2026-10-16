@@ -151,7 +151,9 @@ impl Backend for Gemini {
     }
 
     fn info(&self) -> Vec<(String, String)> {
-        files::info(FILES, LOGIN)
+        let mut rows = files::info(FILES, LOGIN);
+        rows.push(("env".to_string(), ENV_FILE.to_string()));
+        rows
     }
 
     fn knobs(&self) -> Vec<Knob> {

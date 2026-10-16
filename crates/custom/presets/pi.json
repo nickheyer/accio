@@ -1,0 +1,51 @@
+{
+  "command": "pi",
+  "home": "~/.pi/agent",
+  "home_env": "PI_CODING_AGENT_DIR",
+  "copy": [
+    "settings.json",
+    "auth.json",
+    "models.json",
+    "models-store.json",
+    "mcp.json",
+    "keybindings.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "tools",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md"
+  ],
+  "knobs": [
+    { "name": "PROVIDER", "hint": "provider id pi lists the models under" },
+    { "name": "BASE_URL", "hint": "endpoint, ending in /v1 for openai shaped apis" },
+    { "name": "API", "hint": "openai-completions, openai-responses or anthropic-messages" },
+    { "name": "API_KEY", "hint": "bearer token for that endpoint", "secret": true },
+    { "name": "MODEL", "hint": "model id, also the startup default" },
+    { "name": "CONTEXT_WINDOW", "hint": "tokens the model accepts" },
+    { "name": "MAX_TOKENS", "hint": "largest reply in tokens", "secret": false }
+  ],
+  "files": {
+    "merge:models.json": {
+      "providers": {
+        "${PROVIDER}": {
+          "baseUrl": "${BASE_URL}",
+          "api": "${API}",
+          "apiKey": "${API_KEY}",
+          "models": [
+            {
+              "id": "${MODEL}",
+              "contextWindow": "${CONTEXT_WINDOW:json}",
+              "maxTokens": "${MAX_TOKENS:json}"
+            }
+          ]
+        }
+      }
+    },
+    "merge:settings.json": {
+      "defaultProvider": "${PROVIDER}",
+      "defaultModel": "${MODEL}"
+    }
+  }
+}

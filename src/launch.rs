@@ -3,17 +3,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use accio_custom::Definition;
 use accio_provider::Provider;
 use anyhow::{Context, Result};
 
-pub fn run(name: &str, args: &[OsString]) -> Result<()> {
+pub fn run(def: &Definition, args: &[OsString]) -> Result<()> {
+    let name = def.name.as_str();
+    anyhow::ensure!(
+        !def.disabled,
+        "'{name}' is disabled - `accio provider enable {name}` first"
+    );
     let (profile, args) = parse_args(args)?;
     let provider: Box<dyn Provider> = match name {
         "claude" => Box::new(accio_claude::session_provider()?),
         "codex" => Box::new(accio_codex::session_provider()?),
         "grok" => Box::new(accio_grok::session_provider()?),
         "gemini" => Box::new(accio_gemini::session_provider()?),
-        _ => anyhow::bail!("unknown harness '{name}'"),
+        _ => Box::new(accio_custom::session_provider(def)?),
     };
     let (provider, idx) = match profile {
         Some(name) => {

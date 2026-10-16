@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::fsutil::{read_json, sanitize_name, write_atomic};
+use crate::fsutil::{contract, read_json, sanitize_name, write_atomic};
 use crate::{overlay, Account, Fetch, Job, Knob, Provider};
 
 // the parts of a provider that are actually its own
@@ -36,6 +36,11 @@ pub trait Backend {
     // turn filled knobs into profile file entries
     fn compose(&self, _values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         BTreeMap::new()
+    }
+
+    // Knob values back out of a configured profile, None for the generic guess
+    fn decompose(&self, _files: &BTreeMap<String, String>) -> Option<BTreeMap<String, String>> {
+        None
     }
 
     // Whether plain entries amount to a usable login rather than leftovers the cli wrote
@@ -118,7 +123,7 @@ impl<B: Backend> Swap<B> {
         };
         for entry in entries {
             let path = entry?.path();
-            if path.extension().map_or(true, |e| e != "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             let pname = match path.file_stem().and_then(|s| s.to_str()) {
@@ -552,6 +557,10 @@ impl<B: Backend> Provider for Swap<B> {
         self.backend.knobs()
     }
 
+    fn can_login(&self) -> bool {
+        !self.backend.login().is_empty()
+    }
+
     fn configure(
         &mut self,
         name: Option<&str>,
@@ -619,10 +628,12 @@ impl<B: Backend> Provider for Swap<B> {
             return BTreeMap::new();
         };
         // Login accounts are never editable as key value forms
-        if !p.identity.is_empty() || p.files.keys().any(|k| !overlay::is_overlay_key(k)) {
+        if !p.configured() {
             return BTreeMap::new();
         }
-        decompose(&p.files)
+        self.backend
+            .decompose(&p.files)
+            .unwrap_or_else(|| decompose(&p.files))
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -679,11 +690,28 @@ impl<B: Backend> Provider for Swap<B> {
     }
 
     fn info(&self) -> Vec<(String, String)> {
-        self.backend.info()
+        let configured = self.profiles.iter().filter(|p| p.configured()).count();
+        let mut rows = vec![
+            ("profiles".to_string(), contract(&self.dir)),
+            (
+                "accounts".to_string(),
+                format!(
+                    "{} login, {configured} configured",
+                    self.profiles.len() - configured
+                ),
+            ),
+        ];
+        rows.extend(self.backend.info());
+        rows
     }
 }
 
 impl Profile {
+    // Knob built, so overlay entries only and no identity
+    fn configured(&self) -> bool {
+        self.identity.is_empty() && self.files.keys().all(|k| overlay::is_overlay_key(k))
+    }
+
     fn new(name: String, files: BTreeMap<String, String>) -> Self {
         let files = files
             .into_iter()

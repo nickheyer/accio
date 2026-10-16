@@ -14,6 +14,14 @@ pub fn expand(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+// Home back to ~ so paths read short
+pub fn contract(path: &Path) -> String {
+    match dirs::home_dir().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 pub fn sanitize_name(s: &str) -> String {
     s.trim()
         .chars()

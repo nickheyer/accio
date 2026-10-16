@@ -179,7 +179,7 @@ pub fn merge_str(base: &str, patch: &str) -> String {
     canon(&doc).to_string()
 }
 
-fn collect_chains(v: &Value, path: &mut Vec<String>, out: &mut BTreeSet<Vec<String>>) {
+pub(crate) fn collect_chains(v: &Value, path: &mut Vec<String>, out: &mut BTreeSet<Vec<String>>) {
     match v {
         Value::Object(map) if !map.is_empty() => {
             for (k, child) in map {
@@ -227,7 +227,7 @@ fn set_chain(doc: &mut Value, chain: &[String], val: Value) {
 }
 
 // Remove the leaf then prune parents it emptied
-fn remove_chain(doc: &mut Value, chain: &[String]) {
+pub(crate) fn remove_chain(doc: &mut Value, chain: &[String]) {
     let Some(map) = doc.as_object_mut() else {
         return;
     };
@@ -247,7 +247,7 @@ fn remove_chain(doc: &mut Value, chain: &[String]) {
     }
 }
 
-fn deep_merge(dst: &mut Value, src: &Value) {
+pub(crate) fn deep_merge(dst: &mut Value, src: &Value) {
     match (dst, src) {
         (Value::Object(d), Value::Object(s)) => {
             for (k, v) in s {

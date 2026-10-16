@@ -32,6 +32,35 @@ pub fn read_object(path: &Path) -> Result<Value> {
     }
 }
 
+// Patch laid over the object at path, created when missing
+pub fn merge_object(path: &Path, patch: &Value) -> Result<()> {
+    anyhow::ensure!(
+        patch.is_object(),
+        "merge content for {} must be an object",
+        path.display()
+    );
+    let mut doc = read_object(path)?;
+    crate::overlay::deep_merge(&mut doc, patch);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("cant create {}", parent.display()))?;
+    }
+    crate::fsutil::write_atomic(path, serde_json::to_string_pretty(&doc)?.as_bytes())
+}
+
+// Every leaf the patch holds lifted out of the object at path, parents pruned
+pub fn unmerge_object(path: &Path, patch: &Value) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut doc = read_object(path)?;
+    let mut chains = BTreeSet::new();
+    crate::overlay::collect_chains(patch, &mut Vec::new(), &mut chains);
+    for chain in &chains {
+        crate::overlay::remove_chain(&mut doc, chain);
+    }
+    crate::fsutil::write_atomic(path, serde_json::to_string_pretty(&doc)?.as_bytes())
+}
+
 pub fn copy_resources(source: &Path, target: &Path, names: &[&str]) -> Result<()> {
     for name in names {
         copy_resource(&source.join(name), &target.join(name), &mut BTreeSet::new())?;
