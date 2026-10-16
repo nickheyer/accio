@@ -33,9 +33,11 @@ pub fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-// write tmp file in same dir w/ chmod 0600
+// write tmp file in same dir w/ chmod 0600, named per process so concurrent writers never collide
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("accio-tmp");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("accio-tmp-{}-{n}", std::process::id()));
     {
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()

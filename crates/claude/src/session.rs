@@ -9,7 +9,8 @@ use accio_provider::write_atomic;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::Claude;
+use super::{store_dir, Claude};
+use crate::store::Slot;
 
 // Empty values in the command's settings also mask credentials from project settings.
 const AUTH_ENV: &[&str] = &[
@@ -58,10 +59,10 @@ pub(super) fn prepare(
         "separate credential storage",
     )?;
     let source = claude
-        .creds_path
+        .settings_path
         .parent()
         .context("missing Claude config directory")?;
-    let mut settings = read_object(&source.join("settings.json"))?;
+    let mut settings = read_object(&claude.settings_path)?;
     let mut overrides = BTreeMap::<String, String>::new();
     for key in AUTH_ENV {
         overrides.insert((*key).into(), String::new());
@@ -91,18 +92,19 @@ pub(super) fn prepare(
         }
     }
 
-    let credentials = files.get("credentials");
-    if let Some(body) = credentials {
-        let creds: Value =
-            serde_json::from_str(body).context("invalid saved Claude credentials")?;
+    // Every session of an account shares its directory, so claude code refreshes one token chain
+    let store = store_dir(files);
+    if let Some(store) = &store {
+        let creds = Slot::store(store)
+            .read()
+            .context("saved Claude account has no credentials - add the account again")?;
         anyhow::ensure!(
             creds
                 .pointer("/claudeAiOauth/accessToken")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty()),
-            "saved Claude account has no OAuth access token - re-add the account"
+            "saved Claude account has no OAuth access token - add the account again"
         );
-        write_atomic(&dir.join(".credentials.json"), body.as_bytes())?;
     } else {
         let mut found = false;
         for (key, body) in files {
@@ -141,7 +143,7 @@ pub(super) fn prepare(
     let object = config.as_object_mut().unwrap();
     object.remove("oauthAccount");
     object.remove("primaryApiKey");
-    if let Some(account) = files.get("oauth_account").filter(|_| credentials.is_some()) {
+    if let Some(account) = files.get("oauth_account").filter(|_| store.is_some()) {
         object.insert("oauthAccount".into(), serde_json::from_str(account)?);
     }
     write_atomic(
@@ -171,8 +173,14 @@ pub(super) fn prepare(
     let path = dir
         .to_str()
         .context("Claude session directory must be UTF-8")?;
+    let secure = match &store {
+        Some(store) => store
+            .to_str()
+            .context("Claude account directory must be UTF-8")?,
+        None => path,
+    };
     overrides.insert("CLAUDE_CONFIG_DIR".into(), path.into());
-    overrides.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), path.into());
+    overrides.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), secure.into());
     command.envs(&overrides);
     // Command-line settings win over user/project settings without putting secrets in argv.
     let launch_settings = dir.join("accio-settings.json");

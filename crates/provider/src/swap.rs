@@ -47,6 +47,16 @@ pub trait Backend {
     fn owned(&self) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+
+    // Rewrite one profile's entries into the form the backend keeps, true when anything changed
+    fn adopt(&self, _name: &str, _files: &mut BTreeMap<String, String>) -> Result<bool> {
+        Ok(false)
+    }
+
+    // Drop whatever the backend keeps for a removed profile
+    fn forget(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct Swap<B: Backend> {
@@ -131,11 +141,25 @@ impl<B: Backend> Swap<B> {
             store.profiles.push(Profile::new(pname, contents));
         }
         store.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        for i in 0..store.profiles.len() {
+            store.normalize(i)?;
+        }
         if !read_only {
             store.sanitize()?;
             store.absorb_live()?;
         }
         Ok(store)
+    }
+
+    // Backend rewrites of a profile land on disk straight away
+    fn normalize(&mut self, idx: usize) -> Result<bool> {
+        let p = &mut self.profiles[idx];
+        if !self.backend.adopt(&p.name, &mut p.files)? {
+            return Ok(false);
+        }
+        p.derive();
+        save_profile(&self.dir, p)?;
+        Ok(true)
     }
 
     // Junk logins lose their plain entries, login profiles lose stray overlays older versions absorbed
@@ -321,6 +345,7 @@ impl<B: Backend> Swap<B> {
             self.profiles[idx].files = self.own_live(idx);
             self.profiles[idx].derive();
             save_profile(&self.dir, &self.profiles[idx])?;
+            self.normalize(idx)?;
             self.active = Some(idx);
             self.set_marker(idx)?;
             if self.profiles[idx].files != live {
@@ -350,6 +375,7 @@ impl<B: Backend> Swap<B> {
         self.profiles.sort_by(|a, b| a.name.cmp(&b.name));
         self.active = self.profiles.iter().position(|p| p.name == name);
         if let Some(idx) = self.active {
+            self.normalize(idx)?;
             self.set_marker(idx)?;
             if self.profiles[idx].files != live {
                 self.write_surface(&self.profiles[idx].files)?;
@@ -440,6 +466,7 @@ impl<B: Backend> Provider for Swap<B> {
             bail!("'{name}' is the active account - switch to another first");
         }
         fs::remove_file(self.dir.join(format!("{name}.json")))?;
+        self.backend.forget(name)?;
         self.profiles.remove(idx);
         self.active = self.active.map(|a| if a > idx { a - 1 } else { a });
         Ok(())
@@ -486,6 +513,8 @@ impl<B: Backend> Provider for Swap<B> {
             self.profiles[idx].files = incoming.files;
             self.profiles[idx].derive();
             save_profile(&self.dir, &self.profiles[idx])?;
+            self.normalize(idx)?;
+            self.write_surface(&self.profiles[idx].files)?;
             self.active = Some(idx);
             self.set_marker(idx)?;
             return Ok(format!(
@@ -512,6 +541,8 @@ impl<B: Backend> Provider for Swap<B> {
         self.profiles.sort_by(|a, b| a.name.cmp(&b.name));
         self.active = self.profiles.iter().position(|p| p.name == name);
         if let Some(idx) = self.active {
+            self.normalize(idx)?;
+            self.write_surface(&self.profiles[idx].files)?;
             self.set_marker(idx)?;
         }
         Ok(format!("added '{name}' ({email})"))
@@ -640,6 +671,7 @@ impl<B: Backend> Provider for Swap<B> {
         }
         self.profiles[idx].derive();
         save_profile(&self.dir, &self.profiles[idx])?;
+        self.normalize(idx)?;
         if self.active == Some(idx) {
             self.write_surface(&self.profiles[idx].files)?;
         }

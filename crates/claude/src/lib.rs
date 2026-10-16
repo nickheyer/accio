@@ -1,7 +1,8 @@
-//! claude provider - swaps claude code's live credentials, usage from the oauth endpoint
+//! claude provider - each account keeps its credentials in one directory every claude process shares
 
 mod oauth;
 mod session;
+mod store;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,11 +11,12 @@ use std::path::{Path, PathBuf};
 use accio_provider::{
     files, parse_usage, read_json, write_atomic, Backend, Job, Knob, Outcome, Provider, Swap,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+use store::{has_login, Slot};
+
+const POINTER: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 
 pub fn provider() -> Result<impl Provider> {
     migrate_flat_profiles();
@@ -26,34 +28,149 @@ pub fn session_provider() -> Result<impl Provider> {
 }
 
 struct Claude {
-    creds_path: PathBuf,
+    live: Slot,
     claude_json_path: PathBuf,
+    settings_path: PathBuf,
     settings_key: String,
+    stores: PathBuf,
+    sessions: PathBuf,
 }
 
 impl Claude {
     fn locate() -> Result<Self> {
         let home = dirs::home_dir().context("cant determine home dir")?;
-        let (claude_dir, claude_json_path, settings_key) =
+        let config = dirs::config_dir()
+            .context("cant determine config dir")?
+            .join("accio");
+        let (claude_dir, claude_json_path, settings_key, moved) =
             match std::env::var_os("CLAUDE_CONFIG_DIR") {
                 Some(dir) => {
                     let dir = PathBuf::from(dir);
                     let json = dir.join(".claude.json");
                     let settings = dir.join("settings.json").display().to_string();
-                    (dir, json, settings)
+                    (dir, json, settings, true)
                 }
                 None => (
                     home.join(".claude"),
                     home.join(".claude.json"),
                     "~/.claude/settings.json".into(),
+                    false,
                 ),
             };
         Ok(Claude {
-            creds_path: claude_dir.join(".credentials.json"),
+            live: Slot::live(&claude_dir, moved),
             claude_json_path,
+            settings_path: claude_dir.join("settings.json"),
             settings_key,
+            stores: config.join("accounts").join("claude"),
+            sessions: config.join("sessions").join("claude"),
         })
     }
+
+    // Directory the live settings send claude code to for credentials
+    fn pointer(&self) -> Option<PathBuf> {
+        read_json(&self.settings_path)?
+            .pointer(&format!("/env/{POINTER}"))?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn set_pointer(&self, dir: Option<&Path>) -> Result<()> {
+        let mut settings = read_json(&self.settings_path).unwrap_or_else(|| json!({}));
+        let before = settings.clone();
+        let obj = settings
+            .as_object_mut()
+            .with_context(|| format!("{} is not an object", self.settings_path.display()))?;
+        match dir {
+            Some(dir) => {
+                let path = dir.to_str().context("account directory must be UTF-8")?;
+                let env = obj.entry("env").or_insert_with(|| json!({}));
+                if !env.is_object() {
+                    *env = json!({});
+                }
+                env[POINTER] = Value::from(path);
+            }
+            None => {
+                if let Some(env) = obj.get_mut("env").and_then(Value::as_object_mut) {
+                    env.remove(POINTER);
+                    if env.is_empty() {
+                        obj.remove("env");
+                    }
+                }
+            }
+        }
+        if settings == before {
+            return Ok(());
+        }
+        if let Some(parent) = self.settings_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cant create {}", parent.display()))?;
+        }
+        write_atomic(
+            &self.settings_path,
+            serde_json::to_string_pretty(&settings)?.as_bytes(),
+        )
+    }
+
+    // Credentials older accio versions copied into session directories for this account
+    fn left_behind(&self, oauth_account: Option<&String>) -> Vec<Value> {
+        let Some(identity) = oauth_account
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .map(|a| account_identity(&a))
+            .filter(|i| !i.is_empty())
+        else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(&self.sessions) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|dir| {
+                read_json(&dir.join(".claude.json"))
+                    .and_then(|v| v.get("oauthAccount").cloned())
+                    .is_some_and(|a| account_identity(&a).iter().any(|i| identity.contains(i)))
+            })
+            .filter_map(|dir| read_json(&dir.join(".credentials.json")))
+            .filter(has_login)
+            .collect()
+    }
+}
+
+// Email and account id of a claude.json oauthAccount
+fn account_identity(account: &Value) -> Vec<String> {
+    ["emailAddress", "accountUuid"]
+        .iter()
+        .filter_map(|k| account.get(k).and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// The profile entry naming an account directory, with the plan its credentials carry
+fn store_entry(dir: &Path, creds: Option<&Value>) -> String {
+    let mut entry = json!({ "dir": dir.to_string_lossy() });
+    if let Some(plan) = creds
+        .and_then(|c| c.pointer("/claudeAiOauth/subscriptionType"))
+        .and_then(Value::as_str)
+    {
+        entry["subscriptionType"] = Value::from(plan);
+    }
+    entry.to_string()
+}
+
+fn entry_dir(entry: &str) -> Option<PathBuf> {
+    serde_json::from_str::<Value>(entry)
+        .ok()?
+        .get("dir")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+fn store_dir(files: &BTreeMap<String, String>) -> Option<PathBuf> {
+    files.get("credentials_dir").and_then(|e| entry_dir(e))
 }
 
 impl Backend for Claude {
@@ -63,11 +180,23 @@ impl Backend for Claude {
 
     fn read_live(&self) -> BTreeMap<String, String> {
         let mut live = BTreeMap::new();
-        let creds = match read_live_creds(&self.creds_path) {
-            Some(v) => v,
-            None => return live,
-        };
-        live.insert("credentials".to_string(), creds.to_string());
+        match self.pointer() {
+            Some(dir) => match Slot::store(&dir).read() {
+                Some(creds) if has_login(&creds) => {
+                    live.insert(
+                        "credentials_dir".to_string(),
+                        store_entry(&dir, Some(&creds)),
+                    );
+                }
+                _ => return live,
+            },
+            None => match self.live.read() {
+                Some(creds) => {
+                    live.insert("credentials".to_string(), creds.to_string());
+                }
+                None => return live,
+            },
+        }
         if let Some(acct) = read_json(&self.claude_json_path)
             .and_then(|v| v.get("oauthAccount").cloned())
             .filter(|a| !a.is_null())
@@ -77,12 +206,17 @@ impl Backend for Claude {
         live
     }
 
-    // creds go to the keychain/file wholesale, the account only merges into .claude.json
+    // The pointer and account identity go live, credentials only ever sit in account directories
     fn write_live(&self, contents: &BTreeMap<String, String>) -> Result<()> {
-        match contents.get("credentials") {
-            Some(body) => write_live_creds(&self.creds_path, body)?,
-            None => clear_live_creds(&self.creds_path)?,
+        if contents.contains_key("credentials") {
+            bail!("claude credentials belong in an account directory, not the live config");
         }
+        let dir = match contents.get("credentials_dir") {
+            Some(entry) => Some(entry_dir(entry).context("profile names no account directory")?),
+            None => None,
+        };
+        self.set_pointer(dir.as_deref())?;
+        self.live.clear()?;
         match contents.get("oauth_account") {
             Some(acct) => {
                 let account: Value = serde_json::from_str(acct)?;
@@ -137,11 +271,11 @@ impl Backend for Claude {
     }
 
     fn fetch(&self, files: BTreeMap<String, String>) -> Job {
-        fetch(files, true)
+        fetch(files)
     }
 
     fn fetch_read_only(&self, files: BTreeMap<String, String>) -> Job {
-        fetch(files, false)
+        fetch(files)
     }
 
     fn session(
@@ -153,10 +287,14 @@ impl Backend for Claude {
     }
 
     fn is_login(&self, plain: &BTreeMap<String, String>) -> bool {
-        plain
-            .get("credentials")
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .is_some_and(|creds| has_login(&creds))
+        let stored = store_dir(plain)
+            .and_then(|d| Slot::store(&d).read())
+            .is_some_and(|c| has_login(&c));
+        stored
+            || plain
+                .get("credentials")
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .is_some_and(|c| has_login(&c))
     }
 
     fn owned(&self) -> BTreeMap<String, String> {
@@ -168,34 +306,66 @@ impl Backend for Claude {
                 .collect(),
         )
     }
+
+    // Copied credentials move into the profile's own directory, the newest chain of each account wins
+    fn adopt(&self, name: &str, files: &mut BTreeMap<String, String>) -> Result<bool> {
+        let own = self.stores.join(name);
+        let slot = Slot::store(&own);
+        let mut changed = false;
+        if let Some(snapshot) = files.remove("credentials") {
+            changed = true;
+            if let Ok(creds) = serde_json::from_str::<Value>(&snapshot) {
+                slot.offer(&creds)?;
+            }
+            for creds in self.left_behind(files.get("oauth_account")) {
+                slot.offer(&creds)?;
+            }
+        }
+        if let Some(dir) = store_dir(files) {
+            if dir != own && dir.starts_with(&self.stores) {
+                if let Some(creds) = Slot::store(&dir).take()? {
+                    slot.offer(&creds)?;
+                }
+                files.remove("credentials_dir");
+                changed = true;
+            }
+        }
+        let dir = store_dir(files).unwrap_or(own);
+        let creds = Slot::store(&dir).read().filter(has_login);
+        if changed || files.contains_key("credentials_dir") || creds.is_some() {
+            let entry = store_entry(&dir, creds.as_ref());
+            if files.get("credentials_dir") != Some(&entry) {
+                files.insert("credentials_dir".to_string(), entry);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn forget(&self, name: &str) -> Result<()> {
+        let dir = self.stores.join(name);
+        Slot::store(&dir).clear()?;
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| format!("cant remove {}", dir.display()))?;
+        }
+        Ok(())
+    }
 }
 
-// A claude.ai access or refresh token makes a login, mcp discovery state alone does not
-fn has_login(creds: &Value) -> bool {
-    ["accessToken", "refreshToken"].iter().any(|k| {
-        creds
-            .pointer(&format!("/claudeAiOauth/{k}"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-    })
-}
-
-fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
+fn fetch(files: BTreeMap<String, String>) -> Job {
     Box::new(move || {
-        let mut creds: Value = match files
-            .get("credentials")
-            .and_then(|s| serde_json::from_str(s).ok())
-        {
-            Some(v) => v,
+        let Some(dir) = store_dir(&files) else {
+            if files.contains_key("oauth_account") {
+                return Outcome {
+                    usage: Err("no credentials - add this account again".to_string()),
+                    state: None,
+                };
+            }
             // configured profiles have no oauth, show their facts instead
-            None => return files::facts_job(files)(),
+            return files::facts_job(files)();
         };
-        let refreshed = match if refresh {
-            oauth::ensure_fresh(&mut creds)
-        } else {
-            Ok(false)
-        } {
-            Ok(r) => r,
+        let token = match Slot::store(&dir).fresh_token() {
+            Ok(t) => t,
             Err(e) => {
                 return Outcome {
                     usage: Err(format!("{e:#}")),
@@ -203,11 +373,6 @@ fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
                 }
             }
         };
-        let token = creds
-            .pointer("/claudeAiOauth/accessToken")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
         let usage = match oauth::fetch_usage(&token) {
             Ok(v) => {
                 let u = parse_usage(&v);
@@ -219,10 +384,7 @@ fn fetch(files: BTreeMap<String, String>, refresh: bool) -> Job {
             }
             Err(e) => Err(format!("{e:#}")),
         };
-        Outcome {
-            usage,
-            state: refreshed.then(|| json!({ "credentials": creds.to_string() })),
-        }
+        Outcome { usage, state: None }
     })
 }
 
@@ -270,80 +432,35 @@ fn migrate_flat_profiles() {
     }
 }
 
-// Live cc creds sit in the keychain on mac
-fn read_live_creds(creds_path: &Path) -> Option<Value> {
-    #[cfg(target_os = "macos")]
-    if let Some(v) = keychain_read() {
-        return Some(v);
-    }
-    read_json(creds_path)
-}
-
-fn write_live_creds(creds_path: &Path, body: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    if keychain_write(body).is_ok() {
-        // Stale file must not shadow the keychain
-        let _ = fs::remove_file(creds_path);
-        return Ok(());
-    }
-    write_atomic(creds_path, body.as_bytes())
-}
-
-fn clear_live_creds(creds_path: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE])
-        .output();
-    if creds_path.exists() {
-        fs::remove_file(creds_path)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_read() -> Option<Value> {
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_write(body: &str) -> Result<()> {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let out = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            &user,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-            body,
-        ])
-        .output()
-        .context("cant run `security`")?;
-    if !out.status.success() {
-        anyhow::bail!("keychain write failed - is the login keychain unlocked?");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn claude() -> Claude {
+    fn root(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("accio-claude-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("live")).unwrap();
+        d
+    }
+
+    fn claude(root: &Path) -> Claude {
         Claude {
-            creds_path: "/nowhere/.claude/.credentials.json".into(),
-            claude_json_path: "/nowhere/.claude.json".into(),
-            settings_key: "~/.claude/settings.json".into(),
+            live: Slot::live(&root.join("live"), true),
+            claude_json_path: root.join("live/.claude.json"),
+            settings_path: root.join("live/settings.json"),
+            settings_key: root.join("live/settings.json").display().to_string(),
+            stores: root.join("accounts"),
+            sessions: root.join("sessions"),
         }
+    }
+
+    fn creds(expires_at: i64) -> Value {
+        json!({"claudeAiOauth": {"accessToken": format!("a{expires_at}"), "refreshToken": "r",
+            "expiresAt": expires_at, "subscriptionType": "max"}})
+    }
+
+    fn account(email: &str) -> String {
+        json!({"emailAddress": email, "accountUuid": format!("uuid-{email}")}).to_string()
     }
 
     fn plain(creds: &str) -> BTreeMap<String, String> {
@@ -352,7 +469,8 @@ mod tests {
 
     #[test]
     fn login_needs_a_claude_ai_token() {
-        let c = claude();
+        let r = root("login");
+        let c = claude(&r);
         assert!(!c.is_login(&plain(
             r#"{"mcpOAuth":{"plugin:x|1":{"accessToken":"","clientId":"c"}}}"#
         )));
@@ -370,18 +488,181 @@ mod tests {
         assert!(c.is_login(&plain(
             r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"sk-ant-ort01-x"}}"#
         )));
+        let dir = r.join("accounts/nick");
+        let stored = BTreeMap::from([("credentials_dir".to_string(), store_entry(&dir, None))]);
+        assert!(!c.is_login(&stored));
+        Slot::store(&dir).write(&creds(5)).unwrap();
+        assert!(c.is_login(&stored));
+        Slot::store(&dir)
+            .write(&json!({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}))
+            .unwrap();
+        assert!(!c.is_login(&stored));
     }
 
     #[test]
     fn owned_claims_every_knob_in_the_settings_env() {
-        let c = claude();
+        let r = root("owned");
+        let c = claude(&r);
         let owned = c.owned();
-        let doc: Value = serde_json::from_str(&owned["merge:~/.claude/settings.json"]).unwrap();
+        let key = format!("merge:{}", r.join("live/settings.json").display());
+        let doc: Value = serde_json::from_str(&owned[&key]).unwrap();
         let mut keys: Vec<String> = doc["env"].as_object().unwrap().keys().cloned().collect();
         keys.sort();
         let mut knobs: Vec<String> = c.knobs().into_iter().map(|k| k.name).collect();
         knobs.sort();
         assert_eq!(keys, knobs);
         assert!(doc["env"].as_object().unwrap().values().all(|v| v == ""));
+    }
+
+    #[test]
+    fn adopt_moves_a_snapshot_into_the_store_keeping_the_newest_chain() {
+        let r = root("adopt");
+        let c = claude(&r);
+        for (i, (expires, email)) in [(2, "nick@x.co"), (9, "other@x.co"), (3, "nick@x.co")]
+            .iter()
+            .enumerate()
+        {
+            let dir = r.join(format!("sessions/{i}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".credentials.json"), creds(*expires).to_string()).unwrap();
+            fs::write(
+                dir.join(".claude.json"),
+                json!({"oauthAccount": {"emailAddress": email}}).to_string(),
+            )
+            .unwrap();
+        }
+        let mut files = BTreeMap::from([
+            ("credentials".to_string(), creds(1).to_string()),
+            ("oauth_account".to_string(), account("nick@x.co")),
+        ]);
+        assert!(c.adopt("nick", &mut files).unwrap());
+        let dir = r.join("accounts/nick");
+        assert_eq!(
+            files,
+            BTreeMap::from([
+                (
+                    "credentials_dir".to_string(),
+                    store_entry(&dir, Some(&creds(3)))
+                ),
+                ("oauth_account".to_string(), account("nick@x.co")),
+            ])
+        );
+        assert_eq!(store::expires_at(&Slot::store(&dir).read().unwrap()), 3);
+        assert!(!c.adopt("nick", &mut files).unwrap());
+        assert!(files["credentials_dir"].contains("\"subscriptionType\":\"max\""));
+
+        let mut dead = BTreeMap::from([(
+            "credentials".to_string(),
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":""}}"#.to_string(),
+        )]);
+        assert!(c.adopt("dead", &mut dead).unwrap());
+        assert_eq!(
+            dead,
+            BTreeMap::from([(
+                "credentials_dir".to_string(),
+                store_entry(&r.join("accounts/dead"), None)
+            )])
+        );
+        assert!(!c.is_login(&dead));
+        let mut configured = BTreeMap::from([("merge:x".to_string(), "{}".to_string())]);
+        assert!(!c.adopt("glm", &mut configured).unwrap());
+        assert_eq!(configured.len(), 1);
+    }
+
+    #[test]
+    fn adopt_reclaims_a_login_that_landed_in_another_profiles_store() {
+        let r = root("reclaim");
+        let c = claude(&r);
+        let x = r.join("accounts/x");
+        Slot::store(&x).write(&creds(7)).unwrap();
+        let mut files = BTreeMap::from([
+            (
+                "credentials_dir".to_string(),
+                store_entry(&x, Some(&creds(7))),
+            ),
+            ("oauth_account".to_string(), account("y@x.co")),
+        ]);
+        assert!(c.adopt("y", &mut files).unwrap());
+        let y = r.join("accounts/y");
+        assert_eq!(files["credentials_dir"], store_entry(&y, Some(&creds(7))));
+        assert_eq!(store::expires_at(&Slot::store(&y).read().unwrap()), 7);
+        assert!(Slot::store(&x).read().is_none());
+
+        let foreign = r.join("elsewhere");
+        Slot::store(&foreign).write(&creds(8)).unwrap();
+        let mut files =
+            BTreeMap::from([("credentials_dir".to_string(), store_entry(&foreign, None))]);
+        assert!(c.adopt("z", &mut files).unwrap());
+        assert_eq!(
+            files["credentials_dir"],
+            store_entry(&foreign, Some(&creds(8)))
+        );
+        assert!(Slot::store(&foreign).read().is_some());
+        assert!(!r.join("accounts/z").exists());
+        c.forget("y").unwrap();
+        assert!(!y.exists());
+    }
+
+    #[test]
+    fn live_surface_is_the_pointer_and_a_login_without_one_is_a_snapshot() {
+        let r = root("live");
+        let c = claude(&r);
+        assert!(c.read_live().is_empty());
+        fs::write(
+            r.join("live/.claude.json"),
+            json!({"hasCompletedOnboarding": true, "oauthAccount": {"emailAddress": "nick@x.co"}})
+                .to_string(),
+        )
+        .unwrap();
+        c.live.write(&creds(4)).unwrap();
+        let live = c.read_live();
+        assert_eq!(live["credentials"], creds(4).to_string());
+        assert_eq!(live["oauth_account"], r#"{"emailAddress":"nick@x.co"}"#);
+        assert!(c.write_live(&live).is_err());
+
+        let dir = r.join("accounts/nick");
+        Slot::store(&dir).write(&creds(4)).unwrap();
+        let profile = BTreeMap::from([
+            (
+                "credentials_dir".to_string(),
+                store_entry(&dir, Some(&creds(4))),
+            ),
+            ("oauth_account".to_string(), account("nick@x.co")),
+        ]);
+        fs::write(r.join("live/settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        c.write_live(&profile).unwrap();
+        assert!(c.live.read().is_none());
+        assert_eq!(c.pointer().unwrap(), dir);
+        assert_eq!(
+            read_json(&r.join("live/settings.json")).unwrap()["theme"],
+            "dark"
+        );
+        assert_eq!(c.read_live(), profile);
+        assert_eq!(
+            read_json(&r.join("live/.claude.json")).unwrap()["oauthAccount"]["accountUuid"],
+            "uuid-nick@x.co"
+        );
+
+        c.write_live(&BTreeMap::new()).unwrap();
+        assert!(c.pointer().is_none());
+        assert!(read_json(&r.join("live/settings.json"))
+            .unwrap()
+            .get("env")
+            .is_none());
+        assert!(read_json(&r.join("live/.claude.json"))
+            .unwrap()
+            .get("oauthAccount")
+            .is_none());
+        assert!(c.read_live().is_empty());
+        assert!(
+            Slot::store(&dir).read().is_some(),
+            "stores outlive switches"
+        );
+
+        c.write_live(&profile).unwrap();
+        Slot::store(&dir)
+            .write(&json!({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}))
+            .unwrap();
+        assert!(c.read_live().is_empty(), "a logged out store is no login");
     }
 }

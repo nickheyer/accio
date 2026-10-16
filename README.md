@@ -31,7 +31,7 @@ yay -S accio
 There is almost nothing here:
 
 - We are just doing the same thing that claude already does
-- Accounts are backed up and restored from at `~/.config/accio/accounts/<your other account>.json` (linux) or `~/Library/Application Support/accio/accounts` (mac), sorry windows hope for the best
+- Accounts live at `~/.config/accio/accounts/<provider>/<your other account>.json` (linux) or `~/Library/Application Support/accio/accounts` (mac), sorry windows hope for the best
 - Basically just minimizes reauth requirements and lets you switch based on usage
 - Hot reload without downtime like ai god intended.
 - All major harnesses supported (claude code, grok, codex, gemini)
