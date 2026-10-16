@@ -38,7 +38,21 @@ pub struct Definition {
 
 pub struct Registry {
     dir: PathBuf,
+    presets: PathBuf,
     pub definitions: Vec<Definition>,
+}
+
+// A definition template, compiled in or dropped in the presets dir
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preset {
+    pub name: String,
+    pub path: Option<PathBuf>,
+}
+
+const BUNDLED: &[(&str, &str)] = &[("pi", include_str!("../presets/pi.json"))];
+
+fn bundled(name: &str) -> Option<&'static str> {
+    BUNDLED.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
 }
 
 pub fn provider(def: &Definition) -> Result<impl Provider> {
@@ -63,6 +77,7 @@ impl Registry {
 
     // Built ins in their fixed order, then customs by name
     pub fn load_at(dir: PathBuf) -> Result<Self> {
+        let presets = dir.parent().unwrap_or(&dir).join("presets");
         let mut definitions: Vec<Definition> = BUILTIN
             .iter()
             .map(|name| Definition::builtin(name, &dir))
@@ -71,7 +86,11 @@ impl Registry {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Registry { dir, definitions })
+                return Ok(Registry {
+                    dir,
+                    presets,
+                    definitions,
+                })
             }
             Err(e) => return Err(e).with_context(|| format!("cant read {}", dir.display())),
         };
@@ -97,7 +116,45 @@ impl Registry {
         }
         customs.sort_by(|a, b| a.name.cmp(&b.name));
         definitions.extend(customs);
-        Ok(Registry { dir, definitions })
+        Ok(Registry {
+            dir,
+            presets,
+            definitions,
+        })
+    }
+
+    pub fn presets_dir(&self) -> &Path {
+        &self.presets
+    }
+
+    // Compiled in ones first, a file of the same name replaces one
+    pub fn presets(&self) -> Result<Vec<Preset>> {
+        let mut found: BTreeMap<String, Option<PathBuf>> = BUNDLED
+            .iter()
+            .map(|(name, _)| (name.to_string(), None))
+            .collect();
+        match fs::read_dir(&self.presets) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path.extension().is_none_or(|e| e != "json") {
+                        continue;
+                    }
+                    let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    found.insert(name.to_string(), Some(path));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("cant read {}", self.presets.display()))
+            }
+        }
+        Ok(found
+            .into_iter()
+            .map(|(name, path)| Preset { name, path })
+            .collect())
     }
 
     pub fn get(&self, name: &str) -> Option<&Definition> {
@@ -112,8 +169,34 @@ impl Registry {
         self.dir.join(format!("{name}.json"))
     }
 
-    // A preset when one exists for the name, a skeleton to edit otherwise
+    // A skeleton under the name, ready to edit
     pub fn add(&self, name: &str, command: Option<&str>) -> Result<PathBuf> {
+        self.write_new(name, &skeleton(name, command.unwrap_or(name)))
+    }
+
+    // The preset body verbatim under the name, any name works
+    pub fn add_from_preset(&self, preset: &str, name: &str) -> Result<PathBuf> {
+        let found = self
+            .presets()?
+            .into_iter()
+            .find(|p| p.name == preset)
+            .with_context(|| {
+                format!("no preset named '{preset}' - see `accio provider presets`")
+            })?;
+        let body = match &found.path {
+            Some(path) => {
+                fs::read_to_string(path).with_context(|| format!("cant read {}", path.display()))?
+            }
+            None => bundled(preset)
+                .context("bundled preset missing")?
+                .to_string(),
+        };
+        serde_json::from_str::<Value>(&body)
+            .with_context(|| format!("invalid JSON in preset '{preset}'"))?;
+        self.write_new(name, &body)
+    }
+
+    fn write_new(&self, name: &str, body: &str) -> Result<PathBuf> {
         check_name(name)?;
         anyhow::ensure!(
             !BUILTIN.contains(&name),
@@ -125,11 +208,7 @@ impl Registry {
             "'{name}' is already defined in {}",
             path.display()
         );
-        let body = match preset(name) {
-            Some(body) if command.is_none() => body.to_string(),
-            _ => skeleton(name, command.unwrap_or(name)),
-        };
-        Definition::parse(name, &path, &serde_json::from_str(&body)?)?;
+        Definition::parse(name, &path, &serde_json::from_str(body)?)?;
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("cant create {}", self.dir.display()))?;
         write_atomic(&path, body.as_bytes())?;
@@ -395,13 +474,6 @@ fn builtin_disabled(name: &str, path: &Path, value: &Value) -> Result<bool> {
         .map(|d| d.as_bool().context("disabled must be true or false"))
         .transpose()
         .map(|d| d.unwrap_or(false))
-}
-
-fn preset(name: &str) -> Option<&'static str> {
-    match name {
-        "pi" => Some(include_str!("../presets/pi.json")),
-        _ => None,
-    }
 }
 
 fn skeleton(name: &str, command: &str) -> String {
@@ -930,8 +1002,9 @@ mod tests {
     use super::*;
 
     fn tdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("accio-custom-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let base = std::env::temp_dir().join(format!("accio-custom-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let d = base.join("providers");
         fs::create_dir_all(&d).unwrap();
         d
     }
@@ -947,7 +1020,7 @@ mod tests {
         Definition::parse(
             "pi",
             path,
-            &serde_json::from_str(preset("pi").unwrap()).unwrap(),
+            &serde_json::from_str(bundled("pi").unwrap()).unwrap(),
         )
         .unwrap()
     }
@@ -1192,9 +1265,10 @@ mod tests {
         assert_eq!(names, BUILTIN);
         assert!(registry.add("claude", None).is_err());
         assert!(registry.add("list", None).is_err());
-        let path = registry.add("pi", None).unwrap();
+        let path = registry.add_from_preset("pi", "pi").unwrap();
         assert_eq!(path, dir.join("pi.json"));
         assert!(registry.add("pi", None).is_err());
+        assert!(registry.add_from_preset("pi", "pi").is_err());
         registry.add("zed", Some("zed-cli")).unwrap();
         registry.set_disabled("claude", true).unwrap();
         assert_eq!(
@@ -1239,12 +1313,96 @@ mod tests {
     }
 
     #[test]
+    fn presets_list_bundled_and_user_files_and_name_freely() {
+        let dir = tdir("presets");
+        let registry = Registry::load_at(dir.clone()).unwrap();
+        assert_eq!(
+            registry.presets_dir(),
+            dir.parent().unwrap().join("presets")
+        );
+        let listed = registry.presets().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "pi");
+        assert!(listed[0].path.is_none());
+
+        // A plain add never reaches for a preset, whatever the name
+        registry.add("pi", None).unwrap();
+        let names: Vec<String> = registry
+            .presets()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["pi"]);
+        let plain = Registry::load_at(dir.clone()).unwrap();
+        let knobs: Vec<&str> = plain
+            .get("pi")
+            .unwrap()
+            .knobs
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(knobs, ["BASE_URL", "API_KEY"]);
+        assert!(registry.add_from_preset("nope", "x").is_err());
+
+        let presets = registry.presets_dir().to_path_buf();
+        fs::create_dir_all(&presets).unwrap();
+        fs::write(
+            presets.join("zed.json"),
+            r#"{"command": ["zed", "--headless"], "home": "~/.zed"}"#,
+        )
+        .unwrap();
+        fs::write(presets.join("pi.json"), r#"{"home": "~/.pi-mine"}"#).unwrap();
+        fs::write(presets.join("notes.txt"), "ignored").unwrap();
+        let listed = registry.presets().unwrap();
+        let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["pi", "zed"]);
+        assert_eq!(
+            listed[0].path.as_deref(),
+            Some(presets.join("pi.json").as_path())
+        );
+        assert_eq!(
+            listed[1].path.as_deref(),
+            Some(presets.join("zed.json").as_path())
+        );
+
+        let path = registry.add_from_preset("zed", "zed-work").unwrap();
+        assert_eq!(path, dir.join("zed-work.json"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"command": ["zed", "--headless"], "home": "~/.zed"}"#
+        );
+        let reloaded = Registry::load_at(dir.clone()).unwrap();
+        let zed = reloaded.get("zed-work").unwrap();
+        assert_eq!(zed.command, ["zed", "--headless"]);
+        assert_eq!(zed.home, "~/.zed");
+        let mine = registry.add_from_preset("pi", "pi-mine").unwrap();
+        assert_eq!(
+            Registry::load_at(dir.clone())
+                .unwrap()
+                .get("pi-mine")
+                .unwrap()
+                .home,
+            "~/.pi-mine"
+        );
+        assert!(mine.exists());
+
+        fs::write(presets.join("broken.json"), "{").unwrap();
+        let err = registry
+            .add_from_preset("broken", "broken")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid JSON in preset 'broken'"), "{err}");
+        assert!(!dir.join("broken.json").exists());
+    }
+
+    #[test]
     fn drafts_round_trip_definitions_and_save_keeps_disabled() {
         let dir = tdir("draft");
         let registry = Registry::load_at(dir.clone()).unwrap();
         assert!(registry.draft("claude").is_err());
         assert!(registry.draft("nope").is_err());
-        registry.add("pi", None).unwrap();
+        registry.add_from_preset("pi", "pi").unwrap();
         let registry = Registry::load_at(dir.clone()).unwrap();
         let draft = registry.draft("pi").unwrap();
         assert_eq!(draft.command, "pi");

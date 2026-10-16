@@ -226,8 +226,22 @@ fn cmd_provider(args: &[String]) -> Result<()> {
             }
         }
         (Some("add"), Some(name)) => {
-            let path = registry.add(name, args.get(2).map(String::as_str))?;
+            let path = match (args.get(2).map(String::as_str), args.get(3)) {
+                (Some("--preset"), Some(preset)) => registry.add_from_preset(preset, name)?,
+                (Some("--preset"), None) => bail!("usage: accio provider add <name> --preset <preset>"),
+                (command, _) => registry.add(name, command)?,
+            };
             println!("defined '{name}' in {}\nedit it, then `accio configure {name}`", path.display());
+        }
+        (Some("presets"), _) => {
+            for p in registry.presets()? {
+                let from = match p.path {
+                    Some(path) => path.display().to_string(),
+                    None => "bundled".to_string(),
+                };
+                println!("{:<8} {from}", p.name);
+            }
+            println!("drop your own in {}", registry.presets_dir().display());
         }
         (Some("remove"), Some(name)) => {
             registry.remove(name)?;
@@ -247,7 +261,7 @@ fn cmd_provider(args: &[String]) -> Result<()> {
             println!("disabled '{name}'");
         }
         _ => bail!(
-            "usage: accio provider [list | add <name> [command] | remove <name> | enable <name> | disable <name>]"
+            "usage: accio provider [list | presets | add <name> [command | --preset <preset>] | remove <name> | enable <name> | disable <name>]"
         ),
     }
     Ok(())
@@ -266,7 +280,9 @@ usage:
   accio configure <provider> [name] KEY=VALUE...  for advance profile configuration
   accio remove <your other account>               remove an account from accio
   accio provider list                             built in and custom providers
+  accio provider presets                          bundled definition templates
   accio provider add <name> [command]             define a custom provider, then edit the file it prints
+  accio provider add <name> --preset <preset>     define one from a preset
   accio provider remove <name>                    drop a custom provider, its profiles stay on disk
   accio provider enable|disable <name>            show or hide a provider
   accio help                                      show this help"

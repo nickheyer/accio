@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use accio_custom::{Definition, Draft, Registry};
+use accio_custom::{Definition, Draft, Preset, Registry};
 use accio_provider::{
     common_prefix, contract, humanize_until, label, read_json, write_atomic, Account, Fetch, Knob,
     Metric, MetricValue, Outcome, Provider, Scale, Usage,
@@ -143,6 +143,7 @@ enum FormAction {
     Login,
     Configure { editing: Option<String> },
     NewProvider,
+    FromPreset,
     Definition { name: String },
 }
 
@@ -152,8 +153,8 @@ struct Field {
     hint: String,
     value: String,
     secret: bool,
-    // Filled rows of this kind spawn a blank one below
     grows: bool,
+    options: Vec<(String, String)>,
 }
 
 impl Field {
@@ -164,6 +165,47 @@ impl Field {
             value: String::new(),
             secret: false,
             grows: false,
+            options: Vec::new(),
+        }
+    }
+
+    fn choice(label: &str, options: Vec<(String, String)>) -> Self {
+        let mut f = Field::new(label, "nothing to pick from");
+        f.value = options.first().map(|(v, _)| v.clone()).unwrap_or_default();
+        f.options = options;
+        f
+    }
+
+    fn is_choice(&self) -> bool {
+        !self.options.is_empty()
+    }
+
+    fn chosen(&self) -> usize {
+        self.options
+            .iter()
+            .position(|(v, _)| *v == self.value)
+            .unwrap_or(0)
+    }
+
+    fn cycle(&mut self, back: bool) {
+        let n = self.options.len();
+        if n == 0 {
+            return;
+        }
+        let i = self.chosen();
+        let next = if back { (i + n - 1) % n } else { (i + 1) % n };
+        self.value = self.options[next].0.clone();
+    }
+
+    // Typing a letter lands on the next option starting with it
+    fn jump(&mut self, c: char) {
+        let n = self.options.len();
+        let i = self.chosen();
+        let hit = (1..=n)
+            .map(|k| (i + k) % n)
+            .find(|&k| self.options[k].0.starts_with(c));
+        if let Some(k) = hit {
+            self.value = self.options[k].0.clone();
         }
     }
 
@@ -217,17 +259,34 @@ impl Form {
         Form {
             title: " new provider ".to_string(),
             fields: vec![
-                Field::new(
-                    "name",
-                    "lowercase letters, digits, - or _ (pi loads the bundled preset)",
-                ),
-                Field::new(
-                    "command",
-                    "program to run, blank keeps the preset or the name",
-                ),
+                Field::new("name", "lowercase letters, digits, - or _"),
+                Field::new("command", "program to run, defaults to the name"),
             ],
             focus: 0,
             action: FormAction::NewProvider,
+            width: 80,
+        }
+    }
+
+    fn from_preset(presets: &[Preset]) -> Self {
+        let options = presets
+            .iter()
+            .map(|p| {
+                let detail = match &p.path {
+                    Some(path) => contract(path),
+                    None => "bundled".to_string(),
+                };
+                (p.name.clone(), detail)
+            })
+            .collect();
+        Form {
+            title: " new provider from preset ".to_string(),
+            fields: vec![
+                Field::choice("preset", options),
+                Field::new("name", "defaults to the preset name"),
+            ],
+            focus: 0,
+            action: FormAction::FromPreset,
             width: 80,
         }
     }
@@ -548,11 +607,24 @@ impl App {
                         return self.submit_form();
                     }
                 }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    if form.fields[form.focus].is_choice() =>
+                {
+                    form.fields[form.focus].cycle(key.code == KeyCode::Left);
+                }
                 KeyCode::Backspace => {
-                    form.fields[form.focus].value.pop();
+                    let field = &mut form.fields[form.focus];
+                    if !field.is_choice() {
+                        field.value.pop();
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    form.fields[form.focus].value.push(c);
+                    let field = &mut form.fields[form.focus];
+                    if field.is_choice() {
+                        field.jump(c);
+                    } else {
+                        field.value.push(c);
+                    }
                 }
                 _ => {}
             },
@@ -637,25 +709,28 @@ impl App {
         };
         match &form.action {
             FormAction::Login => Ok(Action::Add(form.fields.first().and_then(field_value))),
-            FormAction::NewProvider => {
-                let name = form
+            FormAction::NewProvider | FormAction::FromPreset => {
+                let first = form
                     .fields
                     .first()
                     .and_then(field_value)
                     .unwrap_or_default();
-                let command = form.fields.get(1).and_then(field_value);
-                match self
-                    .registry()
-                    .and_then(|r| r.add(&name, command.as_deref()))
-                {
-                    Ok(path) => {
-                        self.status = format!("defined '{name}' in {}", contract(&path));
-                        self.reload_providers(Some(&name));
-                        match self.registry().and_then(|r| r.draft(&name)) {
-                            Ok(draft) => self.mode = Mode::Form(Form::definition(&draft)),
-                            Err(e) => self.status = format!("{e:#}"),
-                        }
+                let second = form.fields.get(1).and_then(field_value);
+                let manual = matches!(form.action, FormAction::NewProvider);
+                let name = if manual {
+                    first.clone()
+                } else {
+                    second.clone().unwrap_or_else(|| first.clone())
+                };
+                let written = self.registry().and_then(|r| {
+                    if manual {
+                        r.add(&name, second.as_deref())
+                    } else {
+                        r.add_from_preset(&first, &name)
                     }
+                });
+                match written {
+                    Ok(path) => self.defined(&name, &path),
                     Err(e) => {
                         self.status = format!("new provider failed: {e:#}");
                         self.mode = Mode::Form(form);
@@ -733,6 +808,16 @@ impl App {
                 }
                 Ok(Action::None)
             }
+        }
+    }
+
+    // A freshly written definition opens in its edit form
+    fn defined(&mut self, name: &str, path: &Path) {
+        self.status = format!("defined '{name}' in {}", contract(path));
+        self.reload_providers(Some(name));
+        match self.registry().and_then(|r| r.draft(name)) {
+            Ok(draft) => self.mode = Mode::Form(Form::definition(&draft)),
+            Err(e) => self.status = format!("{e:#}"),
         }
     }
 
@@ -884,6 +969,11 @@ impl App {
                 self.mode = Mode::Providers((cursor + 1).min(count.saturating_sub(1)));
             }
             KeyCode::Char('n') => self.mode = Mode::Form(Form::new_provider()),
+            KeyCode::Char('f') => match self.registry().and_then(|r| r.presets()) {
+                Ok(presets) if presets.is_empty() => self.status = "no presets to pick from".into(),
+                Ok(presets) => self.mode = Mode::Form(Form::from_preset(&presets)),
+                Err(e) => self.status = format!("{e:#}"),
+            },
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let Some(def) = def else { return };
                 let enabled = self.definitions.iter().filter(|d| !d.disabled).count();
@@ -1221,7 +1311,7 @@ impl App {
             Paragraph::new(vec![
                 Line::raw(""),
                 Line::styled(
-                    "enter enable/disable · n new · e edit · d remove · esc close",
+                    "enter enable/disable · n new · f from preset · e edit · d remove · esc close",
                     Style::new().dim(),
                 ),
             ]),
@@ -1680,7 +1770,14 @@ fn render_form(f: &mut Frame, form: &Form) {
                 Span::styled(pad(&fl.label, label_w), label_style),
                 Span::raw("  "),
             ];
-            if fl.value.is_empty() {
+            if fl.is_choice() {
+                let (_, detail) = &fl.options[fl.chosen()];
+                let room = value_w.saturating_sub(fl.value.chars().count() + 6);
+                spans.push(Span::styled("< ".to_string(), Style::new().dim()));
+                spans.push(Span::raw(fl.value.clone()));
+                spans.push(Span::styled(" >  ".to_string(), Style::new().dim()));
+                spans.push(Span::styled(clip(detail, room), Style::new().dim()));
+            } else if fl.value.is_empty() {
                 spans.push(Span::styled(
                     clip(&fl.hint, value_w),
                     Style::new().dim().italic(),
@@ -1698,7 +1795,7 @@ fn render_form(f: &mut Frame, form: &Form) {
                     clip(&shown, value_w)
                 }));
             }
-            if focused {
+            if focused && !fl.is_choice() {
                 spans.push(Span::styled("▏", Style::new().dim()));
             }
             Line::from(spans)
@@ -1710,14 +1807,13 @@ fn render_form(f: &mut Frame, form: &Form) {
         Paragraph::new(lines).scroll((scroll as u16, 0)),
         fields_area,
     );
+    let keys = if form.fields.get(form.focus).is_some_and(Field::is_choice) {
+        "←/→ pick · ↑/↓ field · enter next, saves on last · esc cancel"
+    } else {
+        "↑/↓ field · enter next, saves on last · esc cancel"
+    };
     f.render_widget(
-        Paragraph::new(vec![
-            Line::raw(""),
-            Line::styled(
-                "↑/↓ field · enter next, saves on last · esc cancel",
-                Style::new().dim(),
-            ),
-        ]),
+        Paragraph::new(vec![Line::raw(""), Line::styled(keys, Style::new().dim())]),
         hint_area,
     );
 }
@@ -1967,8 +2063,9 @@ mod tests {
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("accio-tui-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let base = std::env::temp_dir().join(format!("accio-tui-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let d = base.join("providers");
         fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2007,6 +2104,75 @@ mod tests {
     }
 
     #[test]
+    fn plain_form_names_no_preset_and_preset_form_cycles_choices() {
+        let dir = scratch_dir("presets");
+        let registry = Registry::load_at(dir.clone()).unwrap();
+        let mut app = App::new(
+            fake_build(&registry).unwrap(),
+            scratch("presets"),
+            dir.clone(),
+        );
+        app.build = fake_build;
+
+        press(&mut app, KeyCode::Char('p'));
+        assert!(screen(&app, 100, 30).contains("f from preset"));
+        press(&mut app, KeyCode::Char('n'));
+        let shown = screen(&app, 100, 30);
+        assert!(shown.contains("new provider"));
+        assert!(!shown.contains("preset"));
+        assert!(!shown.contains("bundled"));
+        press(&mut app, KeyCode::Esc);
+
+        let presets = registry.presets_dir().to_path_buf();
+        fs::create_dir_all(&presets).unwrap();
+        fs::write(
+            presets.join("zed.json"),
+            r#"{"command": ["zed", "--headless"], "home": "~/.zed"}"#,
+        )
+        .unwrap();
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('f'));
+        let picked = |app: &App| match &app.mode {
+            Mode::Form(f) => f.fields[0].value.clone(),
+            _ => panic!("preset form expected"),
+        };
+        assert_eq!(picked(&app), "pi");
+        assert!(screen(&app, 100, 30).contains("bundled"));
+        press(&mut app, KeyCode::Right);
+        assert_eq!(picked(&app), "zed");
+        let shown = screen(&app, 100, 30);
+        assert!(shown.contains("< zed >"));
+        assert!(!shown.contains("bundled"));
+        press(&mut app, KeyCode::Right);
+        assert_eq!(picked(&app), "pi");
+        press(&mut app, KeyCode::Left);
+        assert_eq!(picked(&app), "zed");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(picked(&app), "pi");
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(picked(&app), "zed");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(picked(&app), "zed");
+
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "zed-work");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.starts_with("defined 'zed-work'"),
+            "{}",
+            app.status
+        );
+        assert!(dir.join("zed-work.json").exists());
+        let Mode::Form(form) = &app.mode else {
+            panic!("definition form expected")
+        };
+        assert!(matches!(&form.action, FormAction::Definition { name } if name == "zed-work"));
+        assert_eq!(form.fields[0].value, "zed --headless");
+        assert_eq!(form.fields[1].value, "~/.zed");
+        assert_eq!(app.providers[app.tab].name(), "zed-work");
+    }
+
+    #[test]
     fn providers_overlay_defines_edits_toggles_and_removes() {
         let dir = scratch_dir("providers");
         let registry = Registry::load_at(dir.clone()).unwrap();
@@ -2028,8 +2194,15 @@ mod tests {
         assert!(shown.contains("enabled"));
 
         // A new provider from the bundled preset lands in its definition form
-        press(&mut app, KeyCode::Char('n'));
-        type_text(&mut app, "pi");
+        press(&mut app, KeyCode::Char('f'));
+        let Mode::Form(form) = &app.mode else {
+            panic!("preset form expected")
+        };
+        assert!(matches!(form.action, FormAction::FromPreset));
+        assert_eq!(form.fields[0].value, "pi");
+        let shown = screen(&app, 100, 30);
+        assert!(shown.contains("< pi >"));
+        assert!(shown.contains("bundled"));
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         assert!(dir.join("pi.json").exists());

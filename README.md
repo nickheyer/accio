@@ -53,7 +53,7 @@ accio zai
 
 ## Custom providers
 
-Any harness with a config directory can be a provider without touching accio's code. A definition lives at `~/.config/accio/providers/<name>.json` (mac: `~/Library/Application Support/accio/providers`). `accio provider add pi` writes the bundled pi one:
+Any harness with a config directory can be a provider without touching accio's code. Relevant configs can be found here: `~/.config/accio/providers/<name>.json` or `~/Library/Application Support/accio/providers`
 
 ```json
 {
@@ -88,7 +88,7 @@ Any harness with a config directory can be a provider without touching accio's c
 Profiles are then ordinary configured profiles:
 
 ```sh
-accio provider add pi
+accio provider add pi --preset pi
 accio configure pi nebu PROVIDER=nebu BASE_URL=http://nebu:8484/v1 API=openai-completions API_KEY=... MODEL=freddie
 accio nebu                      # merges into the live ~/.pi/agent, lifts out on the next switch
 accio pi --profile nebu         # private copy of ~/.pi/agent with the profile laid over it
