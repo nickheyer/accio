@@ -14,6 +14,16 @@ use crate::{overlay, Account, Fetch, Job, Knob, Provider};
 // the parts of a provider that are actually its own
 pub trait Backend {
     fn name(&self) -> &str;
+
+    // Where profiles and the active marker live, accio's own account store unless overridden
+    fn dir(&self) -> Result<PathBuf> {
+        Ok(dirs::config_dir()
+            .context("cant determine config dir")?
+            .join("accio")
+            .join("accounts")
+            .join(self.name()))
+    }
+
     fn read_live(&self) -> BTreeMap<String, String>;
     fn write_live(&self, contents: &BTreeMap<String, String>) -> Result<()>;
     fn login(&self) -> &[&str];
@@ -82,27 +92,14 @@ struct Profile {
 
 impl<B: Backend> Swap<B> {
     pub fn load(backend: B) -> Result<Self> {
-        let dir = Self::profile_dir(&backend)?;
-        Self::load_at(backend, dir)
+        let dir = backend.dir()?;
+        Self::read_at(backend, dir, false)
     }
 
     // Launching must not reconcile, migrate, refresh or activate live credentials.
     pub fn load_saved(backend: B) -> Result<Self> {
-        let dir = Self::profile_dir(&backend)?;
+        let dir = backend.dir()?;
         Self::read_at(backend, dir, true)
-    }
-
-    fn profile_dir(backend: &B) -> Result<PathBuf> {
-        let dir = dirs::config_dir()
-            .context("cant determine config dir")?
-            .join("accio")
-            .join("accounts")
-            .join(backend.name());
-        Ok(dir)
-    }
-
-    fn load_at(backend: B, dir: PathBuf) -> Result<Self> {
-        Self::read_at(backend, dir, false)
     }
 
     fn read_at(backend: B, dir: PathBuf, read_only: bool) -> Result<Self> {
@@ -946,6 +943,11 @@ mod tests {
             "fake"
         }
 
+        // Profiles beside the live directory instead of under the user config dir
+        fn dir(&self) -> Result<PathBuf> {
+            Ok(self.dir.with_file_name("store"))
+        }
+
         fn read_live(&self) -> BTreeMap<String, String> {
             let mut live = BTreeMap::new();
             if let Ok(s) = fs::read_to_string(self.creds()) {
@@ -1019,13 +1021,11 @@ mod tests {
     }
 
     fn load(live: &Path, store: &Path) -> Swap<FakeBackend> {
-        Swap::load_at(
-            FakeBackend {
-                dir: live.to_path_buf(),
-            },
-            store.to_path_buf(),
-        )
-        .unwrap()
+        let backend = FakeBackend {
+            dir: live.to_path_buf(),
+        };
+        assert_eq!(backend.dir().unwrap(), store);
+        Swap::load(backend).unwrap()
     }
 
     fn settings(live: &Path) -> Value {
@@ -1057,8 +1057,7 @@ mod tests {
         fs::write(live.join("settings.json"), settings).unwrap();
         let marker = fs::read(store.join(".active")).unwrap();
 
-        let mut session =
-            Swap::read_at(FakeBackend { dir: live.clone() }, store.clone(), true).unwrap();
+        let mut session = Swap::load_saved(FakeBackend { dir: live.clone() }).unwrap();
         session.refresh().unwrap();
         session
             .absorb_fetch("nick", json!({"credentials": "new-token"}))
