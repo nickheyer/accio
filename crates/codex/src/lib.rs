@@ -22,7 +22,12 @@ pub fn session_provider() -> Result<impl Provider> {
 struct Codex;
 
 impl Backend for Codex {
-    fn session(&self, files: &BTreeMap<String, String>, dir: &Path) -> Result<Command> {
+    fn session(
+        &self,
+        files: &BTreeMap<String, String>,
+        _profiles: &[&BTreeMap<String, String>],
+        dir: &Path,
+    ) -> Result<Command> {
         use accio_provider::{session, write_atomic};
         let body = files
             .get(FILES[0])

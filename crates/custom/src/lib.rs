@@ -825,8 +825,8 @@ impl Custom {
         let home_key = def
             .home_env
             .as_deref()
-            .and_then(|v| std::env::var(v).ok())
-            .map(|v| v.trim_end_matches('/').to_string())
+            .and_then(session::relocated)
+            .and_then(|p| p.to_str().map(|v| v.trim_end_matches('/').to_string()))
             .filter(|v| v.starts_with('/') || v.starts_with("~/"))
             .unwrap_or_else(|| def.home.clone());
         Ok(Custom {
@@ -949,7 +949,12 @@ impl Backend for Custom {
     }
 
     // The live home copied, the profile laid over the copy, every knob in the environment
-    fn session(&self, files: &BTreeMap<String, String>, dir: &Path) -> Result<Command> {
+    fn session(
+        &self,
+        files: &BTreeMap<String, String>,
+        profiles: &[&BTreeMap<String, String>],
+        dir: &Path,
+    ) -> Result<Command> {
         let home_env = self.def.home_env.as_deref().with_context(|| {
             format!(
                 "isolated {} sessions need home_env in {}",
@@ -982,6 +987,14 @@ impl Backend for Custom {
         let mut command = Command::new(&self.def.command[0]);
         command.args(&self.def.command[1..]);
         for key in &self.def.unset {
+            command.env_remove(key);
+        }
+        // Every knob any profile exports leaves the inherited environment
+        for key in profiles
+            .iter()
+            .filter_map(|files| self.decompose(files))
+            .flat_map(BTreeMap::into_keys)
+        {
             command.env_remove(key);
         }
         for (key, value) in &values {
@@ -1196,9 +1209,10 @@ mod tests {
             ("API_KEY", "sk-x"),
             ("MODEL", "freddie"),
         ]));
+        let other = custom.compose(&values(&[("PROVIDER", "old"), ("CONTEXT_WINDOW", "8192")]));
         let dir = root.join("session");
         fs::create_dir_all(&dir).unwrap();
-        let command = custom.session(&bag, &dir).unwrap();
+        let command = custom.session(&bag, &[&bag, &other], &dir).unwrap();
 
         assert_eq!(command.get_program(), "fake-cli");
         let args: Vec<_> = command.get_args().collect();
@@ -1216,6 +1230,10 @@ mod tests {
         assert_eq!(envs["API_KEY"].as_deref(), Some("sk-x"));
         assert_eq!(envs["FAKE_MODEL"].as_deref(), Some("nebu/freddie"));
         assert_eq!(envs["OPENAI_API_KEY"], None);
+        assert_eq!(
+            envs["CONTEXT_WINDOW"], None,
+            "other profiles' knobs leave the env"
+        );
 
         let models: Value =
             serde_json::from_slice(&fs::read(dir.join("models.json")).unwrap()).unwrap();
@@ -1247,10 +1265,15 @@ mod tests {
 
         let mut foreign = bag.clone();
         foreign.insert("/elsewhere/x".into(), "x".into());
-        assert!(custom.session(&foreign, &root.join("other")).is_err());
+        assert!(custom
+            .session(&foreign, &[&foreign], &root.join("other"))
+            .is_err());
         let mut nohome = def.clone();
         nohome.home_env = None;
-        assert!(Custom::new(&nohome).unwrap().session(&bag, &dir).is_err());
+        assert!(Custom::new(&nohome)
+            .unwrap()
+            .session(&bag, &[&bag], &dir)
+            .is_err());
     }
 
     #[test]

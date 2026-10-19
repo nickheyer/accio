@@ -1,6 +1,6 @@
 //! A launch never writes to the live settings, credentials or keychain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -46,9 +46,46 @@ fn reserved(key: &str) -> bool {
     )
 }
 
+// Env keys any saved profile sets through a settings.json merge
+fn claimed_env(profiles: &[&BTreeMap<String, String>]) -> BTreeSet<String> {
+    profiles
+        .iter()
+        .flat_map(|files| files.iter())
+        .filter(|(k, _)| k.starts_with("merge:") && k.ends_with("/settings.json"))
+        .filter_map(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .filter_map(|doc| {
+            doc.get("env")?
+                .as_object()
+                .map(|env| env.keys().cloned().collect::<Vec<_>>())
+        })
+        .flatten()
+        .collect()
+}
+
+// Scrubbed keys leave the copy and get masked so no other profile's settings reach the session
+fn scrub_settings(
+    settings: &mut Value,
+    scrub: &dyn Fn(&str) -> bool,
+    overrides: &mut BTreeMap<String, String>,
+) {
+    if let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) {
+        env.retain(|key, _| {
+            if scrub(key) || reserved(key) {
+                if !reserved(key) {
+                    overrides.insert(key.clone(), String::new());
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
 pub(super) fn prepare(
     claude: &Claude,
     files: &BTreeMap<String, String>,
+    profiles: &[&BTreeMap<String, String>],
     dir: &Path,
 ) -> Result<Command> {
     require_version(
@@ -67,28 +104,17 @@ pub(super) fn prepare(
     for key in AUTH_ENV {
         overrides.insert((*key).into(), String::new());
     }
-    // Remove the outgoing profile's environment from this copy, never from the original.
-    if let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) {
-        env.retain(|key, _| {
-            if profile_env(key) || reserved(key) {
-                if !reserved(key) {
-                    overrides.insert(key.clone(), String::new());
-                }
-                false
-            } else {
-                true
-            }
-        });
-    }
+    // Every profile's environment leaves this copy and the inherited env, never the original
+    let claimed = claimed_env(profiles);
+    let scrub = |key: &str| profile_env(key) || claimed.contains(key);
+    scrub_settings(&mut settings, &scrub, &mut overrides);
     settings.as_object_mut().unwrap().remove("apiKeyHelper");
 
     let mut command = Command::new("claude");
     for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(profile_env) {
-            if let Some(key) = key.to_str() {
-                overrides.insert(key.into(), String::new());
-            }
-            command.env_remove(key);
+        if let Some(name) = key.to_str().filter(|k| scrub(k)) {
+            overrides.insert(name.into(), String::new());
+            command.env_remove(&key);
         }
     }
 
@@ -193,4 +219,61 @@ pub(super) fn prepare(
     )?;
     command.arg("--settings").arg(launch_settings);
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claimed_env_collects_every_profiles_settings_keys() {
+        let local = BTreeMap::from([(
+            "merge:~/.claude/settings.json".to_string(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "x", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1"}})
+                .to_string(),
+        )]);
+        let moved = BTreeMap::from([
+            (
+                "merge:/other/settings.json".to_string(),
+                json!({"env": {"EXTRA": "y"}}).to_string(),
+            ),
+            ("/elsewhere/file".to_string(), "not settings".to_string()),
+        ]);
+        let login = BTreeMap::from([("credentials_dir".to_string(), "{}".to_string())]);
+        assert_eq!(
+            claimed_env(&[&local, &moved, &login]),
+            BTreeSet::from([
+                "ANTHROPIC_BASE_URL".to_string(),
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                "EXTRA".to_string(),
+            ])
+        );
+        assert!(claimed_env(&[]).is_empty());
+    }
+
+    #[test]
+    fn scrub_drops_and_masks_claimed_keys_keeping_the_rest() {
+        let mut settings = json!({"theme": "dark", "env": {
+            "ANTHROPIC_MODEL": "m",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1",
+            "CLAUDE_CONFIG_DIR": "/x",
+            "EDITOR": "vi"
+        }});
+        let claimed = BTreeSet::from(["CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string()]);
+        let scrub = |key: &str| profile_env(key) || claimed.contains(key);
+        let mut overrides = BTreeMap::new();
+        scrub_settings(&mut settings, &scrub, &mut overrides);
+        assert_eq!(settings["env"], json!({"EDITOR": "vi"}));
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(
+            overrides,
+            BTreeMap::from([
+                ("ANTHROPIC_MODEL".to_string(), String::new()),
+                ("CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(), String::new()),
+            ])
+        );
+        let mut bare = json!({"theme": "dark"});
+        scrub_settings(&mut bare, &scrub, &mut overrides);
+        assert_eq!(bare, json!({"theme": "dark"}));
+    }
 }

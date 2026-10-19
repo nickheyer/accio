@@ -9,10 +9,21 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 pub fn config_dir(variable: &str, default: &str) -> PathBuf {
-    std::env::var_os(variable)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::fsutil::expand(default))
+    relocated(variable).unwrap_or_else(|| crate::fsutil::expand(default))
+}
+
+// The variable's directory unless empty or one accio itself handed to a session
+pub fn relocated(variable: &str) -> Option<PathBuf> {
+    let sessions = dirs::config_dir().map(|d| d.join("accio").join("sessions"));
+    outside_sessions(
+        std::env::var_os(variable).map(PathBuf::from),
+        sessions.as_deref(),
+    )
+}
+
+fn outside_sessions(dir: Option<PathBuf>, sessions: Option<&Path>) -> Option<PathBuf> {
+    dir.filter(|d| !d.as_os_str().is_empty())
+        .filter(|d| sessions.is_none_or(|s| !d.starts_with(s)))
 }
 
 pub fn read_object(path: &Path) -> Result<Value> {
@@ -117,4 +128,24 @@ pub fn require_version(
         "isolated {program} sessions require {program} {}.{}.{} or newer ({feature}); upgrade the harness first",
         minimum.0, minimum.1, minimum.2);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_directory_never_passes_for_the_live_config() {
+        let sessions = Path::new("/cfg/accio/sessions");
+        let inside = sessions.join("claude").join("123-4-0");
+        assert_eq!(outside_sessions(Some(inside), Some(sessions)), None);
+        let moved = PathBuf::from("/home/me/.claude-work");
+        assert_eq!(
+            outside_sessions(Some(moved.clone()), Some(sessions)),
+            Some(moved.clone())
+        );
+        assert_eq!(outside_sessions(Some(moved.clone()), None), Some(moved));
+        assert_eq!(outside_sessions(Some(PathBuf::new()), Some(sessions)), None);
+        assert_eq!(outside_sessions(None, Some(sessions)), None);
+    }
 }

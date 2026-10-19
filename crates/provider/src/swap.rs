@@ -31,7 +31,13 @@ pub trait Backend {
     fn fetch_read_only(&self, files: BTreeMap<String, String>) -> Job {
         crate::files::facts_job(files)
     }
-    fn session(&self, _files: &BTreeMap<String, String>, _dir: &Path) -> Result<Command> {
+    // Profiles holds every saved profile so a session can scrub what the others set
+    fn session(
+        &self,
+        _files: &BTreeMap<String, String>,
+        _profiles: &[&BTreeMap<String, String>],
+        _dir: &Path,
+    ) -> Result<Command> {
         bail!("'{}' does not support session launches", self.name())
     }
     fn info(&self) -> Vec<(String, String)> {
@@ -643,7 +649,9 @@ impl<B: Backend> Provider for Swap<B> {
 
     fn session(&self, idx: usize, dir: &Path) -> Result<Command> {
         let profile = self.profiles.get(idx).context("no such account")?;
-        self.backend.session(&profile.files, dir)
+        let profiles: Vec<&BTreeMap<String, String>> =
+            self.profiles.iter().map(|p| &p.files).collect();
+        self.backend.session(&profile.files, &profiles, dir)
     }
 
     fn fetches(&self) -> Vec<Fetch> {

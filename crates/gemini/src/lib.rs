@@ -26,8 +26,26 @@ pub fn session_provider() -> Result<impl Provider> {
 
 struct Gemini;
 
+// Keys of every saved profile's env file
+fn env_keys(profiles: &[&BTreeMap<String, String>]) -> Vec<String> {
+    profiles
+        .iter()
+        .filter_map(|files| files.get(ENV_FILE))
+        .flat_map(|body| body.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k.trim().to_string())
+        .collect()
+}
+
 impl Backend for Gemini {
-    fn session(&self, files: &BTreeMap<String, String>, dir: &Path) -> Result<Command> {
+    fn session(
+        &self,
+        files: &BTreeMap<String, String>,
+        profiles: &[&BTreeMap<String, String>],
+        dir: &Path,
+    ) -> Result<Command> {
         use accio_provider::{session, write_atomic};
         session::require_version(
             Command::new("gemini").env("GEMINI_CLI_HOME", dir),
@@ -52,6 +70,10 @@ impl Backend for Gemini {
         )?;
         let mut settings = session::read_object(&source.join("settings.json"))?;
         let mut command = Command::new("gemini");
+        // Every key any profile's env file sets leaves the inherited environment
+        for key in env_keys(profiles) {
+            command.env_remove(key);
+        }
         // Defined empty values also prevent a project's .env from filling in another account.
         for key in [
             "GEMINI_API_KEY",

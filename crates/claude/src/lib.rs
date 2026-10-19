@@ -43,10 +43,10 @@ impl Claude {
         let config = dirs::config_dir()
             .context("cant determine config dir")?
             .join("accio");
+        let sessions = config.join("sessions").join("claude");
         let (claude_dir, claude_json_path, settings_key, moved) =
-            match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            match accio_provider::session::relocated("CLAUDE_CONFIG_DIR") {
                 Some(dir) => {
-                    let dir = PathBuf::from(dir);
                     let json = dir.join(".claude.json");
                     let settings = dir.join("settings.json").display().to_string();
                     (dir, json, settings, true)
@@ -64,7 +64,7 @@ impl Claude {
             settings_path: claude_dir.join("settings.json"),
             settings_key,
             stores: config.join("accounts").join("claude"),
-            sessions: config.join("sessions").join("claude"),
+            sessions,
         })
     }
 
@@ -298,9 +298,10 @@ impl Backend for Claude {
     fn session(
         &self,
         files: &BTreeMap<String, String>,
+        profiles: &[&BTreeMap<String, String>],
         dir: &Path,
     ) -> Result<std::process::Command> {
-        session::prepare(self, files, dir)
+        session::prepare(self, files, profiles, dir)
     }
 
     fn is_login(&self, plain: &BTreeMap<String, String>) -> bool {
