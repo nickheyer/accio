@@ -18,8 +18,8 @@ pub use fsutil::{contract, expand, read_json, sanitize_name, write_atomic};
 pub use overlay::canon_str;
 pub use swap::{Backend, Swap};
 pub use usage::{
-    common_prefix, humanize_until, humanize_when, label, parse_usage, Metric, MetricValue, Scale,
-    Until, Usage,
+    common_prefix, humanize_until, humanize_when, label, local_stamp, parse_usage, Metric,
+    MetricValue, Scale, Until, Usage,
 };
 
 // One setting a hand-configured profile can carry
@@ -52,6 +52,23 @@ pub struct Account {
     pub name: String,
     pub email: Option<String>,
     pub plan: Option<String>,
+}
+
+// What a harness process on the live login is doing right now
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionState {
+    pub id: String,
+    pub state: String,
+    pub mid_turn: bool,
+}
+
+// A harness process on the live login and what a pending login change does to it
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub now: SessionState,
+    pub name: String,
+    pub dir: String,
+    pub effect: String,
 }
 
 pub struct Outcome {
@@ -119,6 +136,16 @@ pub trait Provider {
 
     // Label value pairs the tab's info panel shows
     fn info(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    // Sessions on the live login and what moving it to the target, or to a fresh login, does to each
+    fn sessions(&self, _target: Option<usize>) -> Vec<Session> {
+        Vec::new()
+    }
+
+    // The same sessions with only their state read, cheap enough to poll
+    fn session_states(&self) -> Vec<SessionState> {
         Vec::new()
     }
 }

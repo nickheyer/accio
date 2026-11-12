@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::fsutil::{contract, read_json, sanitize_name, write_atomic};
-use crate::{overlay, Account, Fetch, Job, Knob, Provider};
+use crate::{overlay, Account, Fetch, Job, Knob, Provider, Session, SessionState};
 
 // the parts of a provider that are actually its own
 pub trait Backend {
@@ -41,6 +41,19 @@ pub trait Backend {
         bail!("'{}' does not support session launches", self.name())
     }
     fn info(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    // Sessions on the live login with the effect of moving it to the target profile or a fresh login
+    fn sessions(
+        &self,
+        _profiles: &[(&str, &BTreeMap<String, String>)],
+        _target: Option<usize>,
+    ) -> Vec<Session> {
+        Vec::new()
+    }
+
+    fn session_states(&self) -> Vec<SessionState> {
         Vec::new()
     }
 
@@ -692,6 +705,19 @@ impl<B: Backend> Provider for Swap<B> {
             self.write_surface(&self.profiles[idx].files)?;
         }
         Ok(())
+    }
+
+    fn sessions(&self, target: Option<usize>) -> Vec<Session> {
+        let profiles: Vec<(&str, &BTreeMap<String, String>)> = self
+            .profiles
+            .iter()
+            .map(|p| (p.name.as_str(), &p.files))
+            .collect();
+        self.backend.sessions(&profiles, target)
+    }
+
+    fn session_states(&self) -> Vec<SessionState> {
+        self.backend.session_states()
     }
 
     fn info(&self) -> Vec<(String, String)> {

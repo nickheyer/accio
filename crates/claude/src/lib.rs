@@ -1,5 +1,6 @@
 //! claude provider - each account keeps its credentials in one directory every claude process shares
 
+mod live;
 mod oauth;
 mod session;
 mod store;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use accio_provider::{
     contract, files, parse_usage, read_json, write_atomic, Backend, Job, Knob, Outcome, Provider,
-    Swap,
+    Session, SessionState, Swap,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -29,6 +30,7 @@ pub fn session_provider() -> Result<impl Provider> {
 }
 
 struct Claude {
+    home: PathBuf,
     live: Slot,
     claude_json_path: PathBuf,
     settings_path: PathBuf,
@@ -62,6 +64,7 @@ impl Claude {
             live: Slot::live(&claude_dir, moved),
             claude_json_path,
             settings_path: claude_dir.join("settings.json"),
+            home: claude_dir,
             settings_key,
             stores: config.join("accounts").join("claude"),
             sessions,
@@ -174,6 +177,16 @@ fn store_dir(files: &BTreeMap<String, String>) -> Option<PathBuf> {
     files.get("credentials_dir").and_then(|e| entry_dir(e))
 }
 
+// Organization a profile's login signs thinking under, none for keyed profiles
+fn organization(files: &BTreeMap<String, String>) -> Option<String> {
+    serde_json::from_str::<Value>(files.get("oauth_account")?)
+        .ok()?
+        .get("organizationUuid")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+}
+
 impl Backend for Claude {
     fn name(&self) -> &str {
         "claude"
@@ -269,11 +282,64 @@ impl Backend for Claude {
         ]
     }
 
+    fn sessions(
+        &self,
+        profiles: &[(&str, &BTreeMap<String, String>)],
+        target: Option<usize>,
+    ) -> Vec<Session> {
+        let target = match target.and_then(|i| profiles.get(i)) {
+            Some((name, files)) => match organization(files) {
+                Some(org) => live::Target::Org { name, org },
+                None if files.contains_key("oauth_account") => live::Target::Unknown,
+                None => live::Target::Keyed { name },
+            },
+            None => live::Target::Unknown,
+        };
+        let writer = |org: &str| {
+            profiles
+                .iter()
+                .find(|(_, files)| organization(files).as_deref() == Some(org))
+                .map(|(name, _)| name.to_string())
+        };
+        live::records(&self.home)
+            .into_iter()
+            .map(|record| Session {
+                effect: match &record.session_id {
+                    Some(id) => live::effect(&live::thinking(&self.home, id), &target, &writer),
+                    None => "its registry record names no conversation".to_string(),
+                },
+                now: record.now,
+                name: record.name,
+                dir: record.dir,
+            })
+            .collect()
+    }
+
+    fn session_states(&self) -> Vec<SessionState> {
+        live::records(&self.home)
+            .into_iter()
+            .map(|record| record.now)
+            .collect()
+    }
+
     fn knobs(&self) -> Vec<Knob> {
         vec![
-            Knob::new("ANTHROPIC_BASE_URL", "endpoint claude code talks to"),
-            Knob::secret("ANTHROPIC_AUTH_TOKEN", "bearer token for that endpoint"),
-            Knob::secret("ANTHROPIC_API_KEY", "x-api-key auth instead of bearer"),
+            Knob::new(
+                "ANTHROPIC_BASE_URL",
+                "endpoint claude code talks to, api.anthropic.com when unset",
+            ),
+            Knob::secret(
+                "ANTHROPIC_AUTH_TOKEN",
+                "bearer token for a proxy or gateway endpoint",
+            ),
+            Knob::secret(
+                "ANTHROPIC_API_KEY",
+                "console key, every key in an org spends the same balance",
+            ),
+            Knob::new(
+                "ANTHROPIC_CUSTOM_HEADERS",
+                "Name: Value per line, anthropic-workspace-id for an unscoped key",
+            ),
             Knob::new("ANTHROPIC_MODEL", "model override"),
             Knob::new("ANTHROPIC_SMALL_FAST_MODEL", "background model override"),
         ]
@@ -463,6 +529,7 @@ mod tests {
 
     fn claude(root: &Path) -> Claude {
         Claude {
+            home: root.join("live"),
             live: Slot::live(&root.join("live"), true),
             claude_json_path: root.join("live/.claude.json"),
             settings_path: root.join("live/settings.json"),

@@ -5,6 +5,8 @@ EZ ai credentials/config switcheroo. No slop features, no dashboard, just accio 
   accio                                           open the TUI
   accio <provider> [--profile NAME] [--] [args]   launch as session
   accio <your other account>                      set live account
+  accio ... --wait turns|close                    switch, add or configure once live sessions end their turns or close
+  accio ... --now                                 switch, add or configure without waiting on live sessions
   accio list                                      list accounts
   accio add [provider] [name]                     add currently logged in account or log one in if specified
   accio configure <provider> [name] KEY=VALUE...  for advance profile configuration
@@ -49,6 +51,13 @@ Point a harness at any inference provider without logging in:
 ```
 accio configure claude zai ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=sk-...
 accio zai
+```
+
+Or at a console key, which spends the credit balance of the org it was made in. A key created without a workspace also needs the workspace header:
+
+```
+accio configure claude work ANTHROPIC_API_KEY=sk-ant-...
+accio configure claude work ANTHROPIC_API_KEY=sk-ant-... "ANTHROPIC_CUSTOM_HEADERS=anthropic-workspace-id: wrkspc_..."
 ```
 
 ## Custom providers

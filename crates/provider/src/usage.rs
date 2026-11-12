@@ -74,14 +74,21 @@ impl MetricValue {
                 scale: Scale::Percent,
             } => format_percent(*value),
             MetricValue::Number { value, .. } => format_number(*value),
-            MetricValue::Time(t) => format!(
-                "{} · {}",
-                humanize_when(*t),
-                t.with_timezone(&Local).format("%b %-d, %H:%M")
-            ),
+            MetricValue::Time(t) => format!("{} ({})", humanize_when(*t), local_stamp(*t)),
             MetricValue::Bool(true) => "yes".to_string(),
             MetricValue::Bool(false) => "no".to_string(),
             MetricValue::Text(s) => s.clone(),
+        }
+    }
+
+    // The limit a number counts toward, written the way the number is
+    pub fn ceiling(&self) -> Option<String> {
+        match self {
+            MetricValue::Number {
+                scale: Scale::Limit(limit),
+                ..
+            } => Some(format_number(*limit)),
+            _ => None,
         }
     }
 
@@ -457,6 +464,11 @@ fn humanize_span(secs: i64) -> String {
     }
 }
 
+// Month, day and time of a moment in the local zone
+pub fn local_stamp(t: DateTime<Utc>) -> String {
+    t.with_timezone(&Local).format("%b %-d %H:%M").to_string()
+}
+
 pub fn humanize_until(t: DateTime<Utc>) -> String {
     let secs = (t - Utc::now()).num_seconds();
     if secs <= 0 {
@@ -611,6 +623,17 @@ mod tests {
         );
         assert_eq!(find(&u, "seats").value.fill(12.0), Some(0.25));
         assert_eq!(find(&u, "seats").value.fill(0.0), Some(0.0));
+        assert_eq!(
+            find(&u, "extra_usage.used_credits").value.ceiling(),
+            Some("50".to_string())
+        );
+        assert_eq!(find(&u, "ratio").value.ceiling(), None);
+        assert_eq!(find(&u, "seats").value.ceiling(), None);
+        let stamped = find(&u, "updated_at").value.text();
+        assert!(
+            stamped.ends_with(')') && stamped.contains(" ago ("),
+            "{stamped}"
+        );
     }
 
     #[test]

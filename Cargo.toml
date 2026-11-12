@@ -23,6 +23,7 @@ accio-custom = { path = "crates/custom" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 ureq = { version = "2", features = ["json"] }
 
